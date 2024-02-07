@@ -11,15 +11,21 @@ type CandidateState struct {
 	electionTimeout   int
 }
 
+// startElection initiates an election for a raft server
 func (cs *CandidateState) startElection() {
 	cs.rf.mu.Lock()
+	if !cs.rf.isCandidate() {
+		// If not in candidate state anymore, don't start election
+		cs.rf.mu.Unlock()
+		return
+	}
 
 	cs.rf.currentTerm += 1
 	cs.rf.votedFor = cs.rf.me
 	cs.numOfVotes = 1
 	cs.electionStartTime = time.Now()
-
 	currentTerm := cs.rf.currentTerm
+	DPrintf("NEW ELECTION: TERM %v - CANDIDATE %v", currentTerm, cs.rf.me)
 
 	cs.rf.mu.Unlock()
 
@@ -30,11 +36,13 @@ func (cs *CandidateState) startElection() {
 	}
 }
 
+// isElected returns true if the current raft server has gained the majority of votes
 func (cs *CandidateState) isElected() (bool) {
-	isElected := cs.numOfVotes > (len(cs.rf.peers) / 2 + 1)
+	isElected := cs.numOfVotes >= len(cs.rf.peers) / 2 + 1
 	return isElected
 }
 
+// timedOut returns true if the timeout since the election started has passed
 func (cs *CandidateState) timedOut() (bool) {
 	timedOut := time.Since(cs.electionStartTime) > time.Duration(cs.electionTimeout)*time.Millisecond
 	return timedOut
@@ -52,17 +60,16 @@ func (cs *CandidateState) timedOut() (bool) {
 // handler function on the server side does not return.  Thus there
 // is no need to implement your own timeouts around Call().
 //
-func (cs *CandidateState) sendRequestVote(server int) {
-	// Check if still in candidate state
+func (cs *CandidateState) sendRequestVote(server int, votingTerm int) {
 	cs.rf.mu.Lock()
-	if !cs.rf.isCandidate() {
-		// If not in candidate state anymore, don't send request votes
+	// If not a candidate or not in the expected voting term, stop vote request
+	if !cs.rf.isCandidate() || cs.rf.currentTerm != votingTerm {
 		cs.rf.mu.Unlock()
 		return
 	}
 
 	args := RequestVoteArgs{
-		Term:        cs.rf.currentTerm,
+		Term:        votingTerm,
 		CandidateID: cs.rf.me,
 	}
 	cs.rf.mu.Unlock()
@@ -70,8 +77,7 @@ func (cs *CandidateState) sendRequestVote(server int) {
 	reply := RequestVoteReply{}
 	ok := cs.rf.peers[server].Call("Raft.RequestVote", &args, &reply)
 
-	if !ok return
-
+	if !ok { return }
 
 	cs.rf.mu.Lock()
 	defer cs.rf.mu.Unlock()
@@ -81,15 +87,15 @@ func (cs *CandidateState) sendRequestVote(server int) {
 		cs.rf.currentTerm = reply.Term
 		cs.rf.transitionToFollower()
 		cs.rf.votedFor = -1
+		return
 	}
 
-	// Else if vote granted, if still a candidate, then update numOfvotes
-	else if (cs.rf.isCandidate()) {
+	// Else if vote granted and this is still the same election then update numOfvotes
+	if cs.rf.isCandidate() && votingTerm == cs.rf.currentTerm {
 		if reply.VoteGranted {
-			cs.numOfVotes++
+			cs.numOfVotes += 1
 			if cs.isElected() {
 				cs.rf.transitionToLeader()
-				go cs.rf.sendHeartbeats()
 			}
 		}
 	}

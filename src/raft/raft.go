@@ -81,9 +81,10 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	rf.mu.Lock()
 	term := rf.currentTerm
 	isLeader := rf.isLeader()
-
+	rf.mu.Unlock()
 	return term, isLeader
 }
 
@@ -93,14 +94,17 @@ func (rf *Raft) init() {
 	rf.candidateState = CandidateState{ 
 		rf: rf,
 		numOfVotes: 0,
-		electionTimeout: 300,
+		electionTimeout: 400,
 	}
 	rf.followerState = FollowerState{ 
 		rf: rf,
 		lastHeartbeatTime: time.Now(),
 		heartbeatTimeout: 300,
 	}
-	rf.leaderState = LeaderState{ rf: rf }
+	rf.leaderState = LeaderState{ 
+		rf: rf,
+		heartbeatsStarted: false,
+	}
 
 	rf.votedFor = -1
 	rf.currentTerm = 0
@@ -170,32 +174,38 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-// example RequestVote RPC handler.
+// RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
 	// If candidate is stale then reject
 	if args.Term < rf.currentTerm { // Candidate is of lesser term
-		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
 	}
 
 	// Else if this is stale then become follower and grant vote, no matter what state
-	else if args.Term > rf.currentTerm {
+	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.transitionToFollower()
+		rf.votedFor = args.CandidateID
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
-		rf.votedFor = args.CandidateID
+		return
 	}
 
 	// Else if this hasn't voted for anything this term or has already tried to vote for the candidate, then grant vote
-	else if rf.votedFor == -1 || rf.votedFor == args.CandidateID {
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateID {
 		rf.votedFor = args.CandidateID
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
+		return
 	}
+
+	// Else this has voted for someone else already this term
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
 }
 
 type AppendEntriesArgs struct {
@@ -212,6 +222,7 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+// AppendEntries RPC handler
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -222,12 +233,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// Candidate and got appendEntries from new Leader
+	// Candidate and got appendEntries from new leader with same term
 	if rf.isCandidate() && args.Term == rf.currentTerm {
 		rf.transitionToFollower()
-	} 
-	// Any state and got appendEntries from new leader
-	else if args.Term > rf.currentTerm {
+	} else if args.Term > rf.currentTerm { // Any state and got appendEntries from new leader
 		rf.currentTerm = args.Term
 		rf.transitionToFollower()
 		rf.votedFor = -1
@@ -287,10 +296,8 @@ func (rf *Raft) ticker() {
 		// Check if a leader election should be started.
 		rf.mu.Lock()
 
-		// Check for election timeout
 		if rf.isFollower() {
 			// If the server is a follower, check if it has not received any heartbeat for a timeout.
-			// If the timeout has elapsed, transition to candidate mode and start an election.
 			if rf.followerState.timedOut() {
 				rf.transitionToCandidate()
 				go rf.candidateState.startElection()
@@ -299,35 +306,20 @@ func (rf *Raft) ticker() {
 			//Check for timeout
 			if rf.candidateState.timedOut() {
 				go rf.candidateState.startElection()
-			}
-			//Check for election win
-			else if rf.candidateState.isElected() {
+			} else if rf.candidateState.isElected() {
 				rf.transitionToLeader()
-				go rf.sendHeartbeats()
 			}
-				// If win then immediately send heartbeats
-			//Check for other leader
-				// If there's a message in the channel then there's another leader
 		} else if rf.isLeader() {
-			// If the server is the leader, send heartbeat AppendEntries RPCs to all followers.
-	
-
+			// Send heartbeat AppendEntries RPCs to all followers.
+			rf.transitionToLeader()
 		}
 
 		rf.mu.Unlock()
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Intn(10) % 100)
+		ms := 50 + (rand.Int63() % 250)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
-	}
-}
-
-func (rf *Raft) sendHeartbeats() {
-	for i := range rf.peers {
-		if i != rf.me {
-			go rf.leaderState.sendHeartbeat(i)
-		}
 	}
 }
 
@@ -359,33 +351,42 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
+// UpdateLastHeartbeat updates the last heartbeat time for the follower state.
 func (rf *Raft) updateLastHeartbeat() {
 	rf.followerState.lastHeartbeatTime = time.Now()
 }
 
-// Method to transition Raft to Follower state
+// TransitionToFollower transitions Raft to the follower state.
 func (rf *Raft) transitionToFollower() {
 	rf.currentState = "follower"
 }
 
-// Method to transition Raft to Candidate state
+// TransitionToCandidate transitions Raft to the candidate state.
 func (rf *Raft) transitionToCandidate() {
 	rf.currentState = "candidate"
 }
 
-// Method to transition Raft to Leader state
+// TransitionToLeader transitions Raft to the leader state and starts sending heartbeats if not already started.
 func (rf *Raft) transitionToLeader() {
-	rf.currentState = "leader"
+	if rf.currentState != "leader" && rf.leaderState.heartbeatsStarted == false {
+		rf.leaderState.heartbeatsStarted = true
+		rf.currentState = "leader"
+		go rf.leaderState.sendHeartbeats()
+	}
 }
 
+// IsFollower returns true if Raft is in the follower state.
 func (rf *Raft) isFollower() bool {
 	return rf.currentState == "follower"
 }
 
+// IsLeader returns true if Raft is in the leader state.
 func (rf *Raft) isLeader() bool {
 	return rf.currentState == "leader"
 }
 
+// IsCandidate returns true if Raft is in the candidate state.
 func (rf *Raft) isCandidate() bool {
 	return rf.currentState == "candidate"
 }
+
