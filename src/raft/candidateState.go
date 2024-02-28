@@ -25,7 +25,7 @@ func (cs *CandidateState) startElection() {
 	cs.numOfVotes = 1
 	cs.electionStartTime = time.Now()
 	currentTerm := cs.rf.currentTerm
-	DPrintf("NEW ELECTION: TERM %v - CANDIDATE %v", currentTerm, cs.rf.me)
+	cs.rf.persist()
 
 	cs.rf.mu.Unlock()
 
@@ -37,13 +37,13 @@ func (cs *CandidateState) startElection() {
 }
 
 // isElected returns true if the current raft server has gained the majority of votes
-func (cs *CandidateState) isElected() (bool) {
-	isElected := cs.numOfVotes >= len(cs.rf.peers) / 2 + 1
+func (cs *CandidateState) isElected() bool {
+	isElected := cs.numOfVotes >= len(cs.rf.peers)/2+1
 	return isElected
 }
 
 // timedOut returns true if the timeout since the election started has passed
-func (cs *CandidateState) timedOut() (bool) {
+func (cs *CandidateState) timedOut() bool {
 	timedOut := time.Since(cs.electionStartTime) > time.Duration(cs.electionTimeout)*time.Millisecond
 	return timedOut
 }
@@ -59,7 +59,6 @@ func (cs *CandidateState) timedOut() (bool) {
 // Call() is guaranteed to return (perhaps after a delay) *except* if the
 // handler function on the server side does not return.  Thus there
 // is no need to implement your own timeouts around Call().
-//
 func (cs *CandidateState) sendRequestVote(server int, votingTerm int) {
 	cs.rf.mu.Lock()
 	// If not a candidate or not in the expected voting term, stop vote request
@@ -69,15 +68,19 @@ func (cs *CandidateState) sendRequestVote(server int, votingTerm int) {
 	}
 
 	args := RequestVoteArgs{
-		Term:        votingTerm,
-		CandidateID: cs.rf.me,
+		Term:         votingTerm,
+		LastLogIndex: len(cs.rf.log) - 1,
+		LastLogTerm:  cs.rf.log[len(cs.rf.log)-1].Term,
+		CandidateID:  cs.rf.me,
 	}
 	cs.rf.mu.Unlock()
 
 	reply := RequestVoteReply{}
 	ok := cs.rf.peers[server].Call("Raft.RequestVote", &args, &reply)
 
-	if !ok { return }
+	if !ok {
+		return
+	}
 
 	cs.rf.mu.Lock()
 	defer cs.rf.mu.Unlock()
@@ -87,6 +90,7 @@ func (cs *CandidateState) sendRequestVote(server int, votingTerm int) {
 		cs.rf.currentTerm = reply.Term
 		cs.rf.transitionToFollower()
 		cs.rf.votedFor = -1
+		cs.rf.persist()
 		return
 	}
 
