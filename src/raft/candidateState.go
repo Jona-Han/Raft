@@ -15,7 +15,6 @@ type CandidateState struct {
 func (cs *CandidateState) startElection() {
 	cs.rf.mu.Lock()
 	if !cs.rf.isCandidate() {
-		// If not in candidate state anymore, don't start election
 		cs.rf.mu.Unlock()
 		return
 	}
@@ -60,47 +59,54 @@ func (cs *CandidateState) timedOut() bool {
 // handler function on the server side does not return.  Thus there
 // is no need to implement your own timeouts around Call().
 func (cs *CandidateState) sendRequestVote(server int, votingTerm int) {
-	cs.rf.mu.Lock()
-	// If not a candidate or not in the expected voting term, stop vote request
-	if !cs.rf.isCandidate() || cs.rf.currentTerm != votingTerm {
+	for !cs.rf.killed() {
+		cs.rf.mu.Lock()
+		// If not a candidate or not in the expected voting term, stop vote request
+		if !cs.rf.isCandidate() || cs.rf.currentTerm != votingTerm {
+			cs.rf.mu.Unlock()
+			return
+		}
+
+		args := RequestVoteArgs{
+			Term:         votingTerm,
+			LastLogIndex: cs.rf.log[len(cs.rf.log)-1].Index,
+			LastLogTerm:  cs.rf.log[len(cs.rf.log)-1].Term,
+			CandidateID:  cs.rf.me,
+		}
 		cs.rf.mu.Unlock()
-		return
-	}
 
-	args := RequestVoteArgs{
-		Term:         votingTerm,
-		LastLogIndex: len(cs.rf.log) - 1,
-		LastLogTerm:  cs.rf.log[len(cs.rf.log)-1].Term,
-		CandidateID:  cs.rf.me,
-	}
-	cs.rf.mu.Unlock()
+		reply := RequestVoteReply{}
+		ok := cs.rf.peers[server].Call("Raft.RequestVote", &args, &reply)
 
-	reply := RequestVoteReply{}
-	ok := cs.rf.peers[server].Call("Raft.RequestVote", &args, &reply)
+		// if !ok {
+		// 	return
+		// }
+		if !ok {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
 
-	if !ok {
-		return
-	}
+		cs.rf.mu.Lock()
+		defer cs.rf.mu.Unlock()
 
-	cs.rf.mu.Lock()
-	defer cs.rf.mu.Unlock()
+		// If this is stale, then convert to follower
+		if reply.Term > cs.rf.currentTerm {
+			cs.rf.currentTerm = reply.Term
+			cs.rf.transitionToFollower()
+			cs.rf.votedFor = -1
+			cs.rf.persist()
+			return
+		}
 
-	// If this is stale, then convert to follower
-	if reply.Term > cs.rf.currentTerm {
-		cs.rf.currentTerm = reply.Term
-		cs.rf.transitionToFollower()
-		cs.rf.votedFor = -1
-		cs.rf.persist()
-		return
-	}
-
-	// Else if vote granted and this is still the same election then update numOfvotes
-	if cs.rf.isCandidate() && votingTerm == cs.rf.currentTerm {
-		if reply.VoteGranted {
-			cs.numOfVotes += 1
-			if cs.isElected() {
-				cs.rf.transitionToLeader()
+		// Else if vote granted and this is still the same election then update numOfvotes
+		if cs.rf.isCandidate() && votingTerm == cs.rf.currentTerm {
+			if reply.VoteGranted {
+				cs.numOfVotes += 1
+				if cs.isElected() {
+					cs.rf.transitionToLeader()
+				}
 			}
 		}
+		return
 	}
 }

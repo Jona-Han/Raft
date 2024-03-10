@@ -6,17 +6,15 @@ import (
 )
 
 type LeaderState struct {
-	rf                *Raft
-	heartbeatsStarted bool
-	nextIndex         map[int]int
-	matchIndex        map[int]int
-	cond              *sync.Cond
+	rf         *Raft
+	nextIndex  map[int]int
+	matchIndex map[int]int
+	cond       *sync.Cond
+	hbCond     *sync.Cond
 }
 
 func (ls *LeaderState) init() {
-	ls.heartbeatsStarted = true
-
-	lastLogIndex := len(ls.rf.log) - 1
+	lastLogIndex := ls.rf.log[len(ls.rf.log)-1].Index
 	for key := range ls.rf.peers {
 		ls.nextIndex[key] = lastLogIndex + 1
 		ls.matchIndex[key] = 0
@@ -24,8 +22,7 @@ func (ls *LeaderState) init() {
 }
 
 func (ls *LeaderState) sendLogs() {
-	DPrintf("CALL TO SENDLOGS")
-	lastLogIndex := len(ls.rf.log) - 1
+	lastLogIndex := ls.rf.log[len(ls.rf.log)-1].Index
 	for key, value := range ls.nextIndex {
 		if key != ls.rf.me && lastLogIndex >= value {
 			go ls.sendLog(key)
@@ -71,8 +68,8 @@ func (ls *LeaderState) sendLog(server int) {
 			ls.rf.currentTerm = reply.Term
 			ls.rf.transitionToFollower()
 			ls.rf.votedFor = -1
-			defer ls.rf.mu.Unlock()
 			ls.rf.persist()
+			ls.rf.mu.Unlock()
 			return
 		}
 
@@ -84,11 +81,27 @@ func (ls *LeaderState) sendLog(server int) {
 				ls.matchIndex[server] = args.Entries[lastLogEntry].Index
 				go ls.newCommitMajorityChecker()
 			}
-			defer ls.rf.mu.Unlock()
+			ls.rf.mu.Unlock()
 			return
-		} else {
-			ls.nextIndex[server] = max(0, ls.nextIndex[server]-1)
-			// DPrintf("Decrementing nextIndex from %v to %v", ls.nextIndex[server]+1, ls.nextIndex[server])
+		} else { //Failure
+			//Log too short
+			if reply.XIndex == 0 {
+				ls.nextIndex[server] = max(1, reply.XLen)
+			} else {
+				XTermLastIndex := -1
+				for idx, entry := range ls.rf.log {
+					if entry.Term == reply.XTerm {
+						XTermLastIndex = idx
+						break
+					}
+				}
+
+				if XTermLastIndex == -1 {
+					ls.nextIndex[server] = reply.XIndex
+				} else {
+					ls.nextIndex[server] = XTermLastIndex
+				}
+			}
 		}
 		ls.rf.mu.Unlock()
 	}
@@ -124,11 +137,9 @@ func (ls *LeaderState) newCommitMajorityChecker() {
 func (ls *LeaderState) sendHeartbeats() {
 	for !ls.rf.killed() {
 		ls.rf.mu.Lock()
-		// If not in leader state anymore, don't send heartbeats
+
 		if !ls.rf.isLeader() {
-			ls.heartbeatsStarted = false
-			ls.rf.mu.Unlock()
-			return
+			ls.hbCond.Wait()
 		}
 		ls.rf.mu.Unlock()
 
@@ -141,7 +152,6 @@ func (ls *LeaderState) sendHeartbeats() {
 		heartbeatSleepTime := 100
 		time.Sleep(time.Duration(heartbeatSleepTime) * time.Millisecond)
 	}
-	ls.heartbeatsStarted = false
 }
 
 // sendHeartbeat sends a heartbeat RPC call to the server in param

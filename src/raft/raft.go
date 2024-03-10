@@ -77,6 +77,8 @@ type Raft struct {
 
 	commitIndex int
 	lastApplied int
+
+	snapshot []byte
 }
 
 // return currentTerm and whether this server believes it is the leader.
@@ -105,11 +107,11 @@ func (rf *Raft) init() {
 		heartbeatTimeout:  300,
 	}
 	rf.leaderState = LeaderState{
-		rf:                rf,
-		heartbeatsStarted: false,
-		nextIndex:         make(map[int]int),
-		matchIndex:        make(map[int]int),
-		cond:              sync.NewCond(&rf.mu),
+		rf:         rf,
+		nextIndex:  make(map[int]int),
+		matchIndex: make(map[int]int),
+		cond:       sync.NewCond(&rf.mu),
+		hbCond:     sync.NewCond(&rf.mu),
 	}
 
 	rf.votedFor = -1
@@ -138,7 +140,12 @@ func (rf *Raft) persist() {
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+
+	if rf.snapshot != nil {
+		rf.persister.Save(raftstate, rf.snapshot)
+	} else {
+		rf.persister.Save(raftstate, nil)
+	}
 }
 
 // restore previously persisted state.
@@ -152,21 +159,10 @@ func (rf *Raft) readPersist(data []byte) {
 	var votedFor int
 	var log []LogEntry
 
-	err := d.Decode(&currentTerm)
-	if err != nil {
-		fmt.Println("Error decoding currentTerm:", err)
-		return
-	}
-
-	err = d.Decode(&votedFor)
-	if err != nil {
-		fmt.Println("Error decoding votedFor:", err)
-		return
-	}
-
-	err = d.Decode(&log)
-	if err != nil {
-		fmt.Println("Error decoding log:", err)
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		fmt.Println("Error decoding persist")
 		return
 	}
 
@@ -181,8 +177,29 @@ func (rf *Raft) readPersist(data []byte) {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	if index <= rf.log[0].Index {
+		// Ignore if index is not greater than current snapshotIndex
+		return
+	}
+
+	// Update snapshot data
+	rf.snapshot = snapshot
+	// rf.snapshotIndex = index
+	// rf.snapshotTerm = rf.log[index-rf.log[0].Index].Term // Adjust for potential offset in log indexing
+
+	rf.log[0] = LogEntry{
+		Index: index,
+		Term:  rf.log[index-rf.log[1].Index].Term,
+	}
+
+	// Discard log entries before index
+	rf.log = rf.log[index-rf.log[0].Index:]
+
+	// Persist state and snapshot
+	rf.persist()
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -217,6 +234,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.log = append(rf.log, newEntry)
 	rf.leaderState.cond.Signal()
+	rf.persist()
 	return index, term, true
 }
 
@@ -232,6 +250,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.leaderState.cond.Broadcast()
+	rf.leaderState.hbCond.Broadcast()
 }
 
 func (rf *Raft) killed() bool {
@@ -240,12 +260,11 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-	for !rf.killed() {
-		// Your code here (2A)
-		// Check if a leader election should be started.
-		ms := 350 + (rand.Int63() % 150)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+	ms := 300 + (rand.Int63() % 150)
+	time.Sleep(time.Duration(ms) * time.Millisecond)
 
+	for !rf.killed() {
+		// Check if a leader election should be started.
 		rf.mu.Lock()
 		if rf.isFollower() {
 			// If the server is a follower, check if it has not received any heartbeat for a timeout.
@@ -257,15 +276,10 @@ func (rf *Raft) ticker() {
 			//Check for timeout
 			if rf.candidateState.timedOut() {
 				go rf.candidateState.startElection()
-			} else if rf.candidateState.isElected() {
-				rf.transitionToLeader()
 			}
-		} else if rf.isLeader() {
-			// Send heartbeat AppendEntries RPCs to all followers.
-			rf.transitionToLeader()
 		}
-
 		rf.mu.Unlock()
+		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
@@ -285,7 +299,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
-	// Your initialization code here (2A, 2B, 2C).
 	rf.init()
 
 	// initialize from state persisted before a crash
@@ -295,6 +308,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 	go rf.logSender()
 	go rf.commandApplier(applyCh)
+	go rf.leaderState.sendHeartbeats()
 
 	return rf
 }
@@ -302,7 +316,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func (rf *Raft) commandApplier(applyCh chan ApplyMsg) {
 	for !rf.killed() {
 		rf.mu.Lock()
-		if rf.commitIndex > rf.lastApplied {
+		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
 			applyMsg := ApplyMsg{
 				CommandValid: true,
@@ -322,7 +336,7 @@ func (rf *Raft) logSender() {
 	for !rf.killed() {
 		rf.mu.Lock()
 
-		for !rf.isLeader() {
+		if !rf.isLeader() {
 			rf.leaderState.cond.Wait()
 		}
 
@@ -350,11 +364,9 @@ func (rf *Raft) transitionToCandidate() {
 
 // TransitionToLeader transitions Raft to the leader state and starts sending heartbeats if not already started.
 func (rf *Raft) transitionToLeader() {
-	if rf.currentState != "leader" && !rf.leaderState.heartbeatsStarted {
-		rf.leaderState.init()
-		rf.currentState = "leader"
-		go rf.leaderState.sendHeartbeats()
-	}
+	rf.leaderState.init()
+	rf.currentState = "leader"
+	rf.leaderState.hbCond.Signal()
 }
 
 // IsFollower returns true if Raft is in the follower state.
