@@ -23,9 +23,9 @@ func (ls *LeaderState) init() {
 
 func (ls *LeaderState) sendLogs() {
 	lastLogIndex := ls.rf.log[len(ls.rf.log)-1].Index
-	for key, value := range ls.nextIndex {
-		if key != ls.rf.me && lastLogIndex >= value {
-			go ls.sendLog(key)
+	for server, value := range ls.nextIndex {
+		if server != ls.rf.me && lastLogIndex >= value {
+			go ls.sendLog(server)
 		}
 	}
 }
@@ -40,20 +40,34 @@ func (ls *LeaderState) sendLog(server int) {
 		}
 
 		nextIndex := ls.nextIndex[server]
+		lastEntryIndex := ls.rf.log[len(ls.rf.log)-1].Index
+		snapshotIndex := ls.rf.log[0].Index
+
+		if nextIndex <= snapshotIndex {
+			ls.rf.mu.Unlock()
+			ls.sendSnapshot(server)
+			return
+		}
+
+		if lastEntryIndex < nextIndex {
+			ls.nextIndex[server] = lastEntryIndex
+			ls.rf.mu.Unlock()
+			return
+		}
 
 		args := AppendEntriesArgs{
 			Term:         ls.rf.currentTerm,
 			LeaderId:     ls.rf.me,
 			PrevLogIndex: nextIndex - 1,
-			PrevLogTerm:  ls.rf.log[nextIndex-1].Term,
-			Entries:      make([]LogEntry, len(ls.rf.log)-nextIndex),
-			LeaderCommit: ls.rf.commitIndex,
+			PrevLogTerm:  ls.rf.log[nextIndex-snapshotIndex-1].Term,
+			Entries:      make([]LogEntry, lastEntryIndex-nextIndex+1),
 		}
-		copy(args.Entries, ls.rf.log[nextIndex:len(ls.rf.log)])
-		// DPrintf("%v sending logs to %v", ls.rf.me, server)
+
+		copy(args.Entries, ls.rf.log[nextIndex-snapshotIndex:])
 		ls.rf.mu.Unlock()
 
 		reply := AppendEntriesReply{}
+		// DPrintf("LEADER: %v sending logs to server:%v prevLogIndex: %v, len(entries):%v, commitIndex: %v, entries: %v", ls.rf.me, server, args.PrevLogIndex, len(args.Entries), args.LeaderCommit, args.Entries)
 		ok := ls.rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
 
 		if !ok {
@@ -84,14 +98,13 @@ func (ls *LeaderState) sendLog(server int) {
 			ls.rf.mu.Unlock()
 			return
 		} else { //Failure
-			//Log too short
-			if reply.XIndex == 0 {
-				ls.nextIndex[server] = max(1, reply.XLen)
+			if reply.XIndex == 0 { //Log too short
+				ls.nextIndex[server] = max(1, reply.XLen+1)
 			} else {
 				XTermLastIndex := -1
-				for idx, entry := range ls.rf.log {
+				for _, entry := range ls.rf.log {
 					if entry.Term == reply.XTerm {
-						XTermLastIndex = idx
+						XTermLastIndex = entry.Index
 						break
 					}
 				}
@@ -107,6 +120,40 @@ func (ls *LeaderState) sendLog(server int) {
 	}
 }
 
+func (ls *LeaderState) sendSnapshot(server int) {
+	DPrintf("%v: -- Leader -- Send snapshot to %v -- lastApplied: %v, commitIndex: %v", ls.rf.me, server, ls.rf.lastApplied, ls.rf.commitIndex)
+	for !ls.rf.killed() {
+		ls.rf.mu.Lock()
+		args := InstallSnapshotArgs{
+			Term:              ls.rf.currentTerm,
+			LeaderId:          ls.rf.me,
+			LastIncludedIndex: ls.rf.log[0].Index,
+			LastIncludedTerm:  ls.rf.log[0].Term,
+			Data:              ls.rf.snapshot,
+		}
+		reply := InstallSnapshotReply{}
+		ls.rf.mu.Unlock()
+
+		ok := ls.rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply)
+		if !ok {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		ls.rf.mu.Lock()
+		if reply.Term > ls.rf.currentTerm {
+			ls.rf.currentTerm = reply.Term
+			ls.rf.transitionToFollower()
+			ls.rf.votedFor = -1
+			ls.rf.persist()
+		}
+		ls.nextIndex[server] = args.LastIncludedIndex + 1
+		ls.matchIndex[server] = args.LastIncludedIndex
+		ls.rf.mu.Unlock()
+		return
+	}
+}
+
 func (ls *LeaderState) newCommitMajorityChecker() {
 	// If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N,
 	// and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4).
@@ -118,6 +165,7 @@ func (ls *LeaderState) newCommitMajorityChecker() {
 		}
 	}
 
+	snapshotIndex := ls.rf.log[0].Index
 	for n := maxMatchIndex; n > ls.rf.commitIndex; n-- {
 		count := 1
 		for server, matchIndex := range ls.matchIndex {
@@ -125,8 +173,10 @@ func (ls *LeaderState) newCommitMajorityChecker() {
 				count++
 			}
 		}
-		if count > len(ls.matchIndex)/2 && ls.rf.log[n].Term == ls.rf.currentTerm {
+		if count > len(ls.matchIndex)/2 &&
+			ls.rf.log[n-snapshotIndex].Term == ls.rf.currentTerm {
 			ls.rf.commitIndex = n
+			ls.rf.applyCond.Signal()
 			break
 		}
 	}
@@ -163,14 +213,11 @@ func (ls *LeaderState) sendHeartbeat(server int) {
 		return
 	}
 
-	prevLogIndex := len(ls.rf.log) - 1
-	prevLogTerm := ls.rf.log[prevLogIndex].Term
-
 	args := AppendEntriesArgs{
 		Term:         ls.rf.currentTerm,
 		LeaderId:     ls.rf.me,
-		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  prevLogTerm,
+		PrevLogIndex: ls.rf.log[len(ls.rf.log)-1].Index,
+		PrevLogTerm:  ls.rf.log[len(ls.rf.log)-1].Term,
 		Entries:      make([]LogEntry, 0),
 		LeaderCommit: ls.rf.commitIndex,
 	}

@@ -78,7 +78,9 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 
-	snapshot []byte
+	snapshot  []byte
+	applyCh   chan ApplyMsg
+	applyCond *sync.Cond
 }
 
 // return currentTerm and whether this server believes it is the leader.
@@ -119,6 +121,8 @@ func (rf *Raft) init() {
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.log = make([]LogEntry, 1)
+	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.snapshot = nil
 
 	rf.log[0] = LogEntry{
 		Index: 0,
@@ -141,35 +145,65 @@ func (rf *Raft) persist() {
 	e.Encode(rf.log)
 	raftstate := w.Bytes()
 
-	if rf.snapshot != nil {
-		rf.persister.Save(raftstate, rf.snapshot)
-	} else {
-		rf.persister.Save(raftstate, nil)
-	}
+	rf.persister.Save(raftstate, rf.snapshot)
 }
 
 // restore previously persisted state.
-func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
-	}
-	r := bytes.NewBuffer(data)
-	d := labgob.NewDecoder(r)
-	var currentTerm int
-	var votedFor int
-	var log []LogEntry
+func (rf *Raft) readPersist() {
+	data := rf.persister.ReadRaftState()
+	if rf.persister.RaftStateSize() > 0 { // bootstrap without any state?
+		r := bytes.NewBuffer(data)
+		d := labgob.NewDecoder(r)
+		var currentTerm int
+		var votedFor int
+		var log []LogEntry
 
-	if d.Decode(&currentTerm) != nil ||
-		d.Decode(&votedFor) != nil ||
-		d.Decode(&log) != nil {
-		fmt.Println("Error decoding persist")
-		return
+		if d.Decode(&currentTerm) != nil ||
+			d.Decode(&votedFor) != nil ||
+			d.Decode(&log) != nil {
+
+			fmt.Println("Error decoding persist")
+			return
+		}
+
+		//success
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
 	}
 
-	//success
-	rf.currentTerm = currentTerm
-	rf.votedFor = votedFor
-	rf.log = log
+	snapshot := rf.persister.ReadSnapshot()
+	if rf.persister.SnapshotSize() > 0 {
+		rf.snapshot = snapshot
+
+		go func() {
+			applyMsg := ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      snapshot,
+				SnapshotTerm:  rf.log[0].Term,
+				SnapshotIndex: rf.log[0].Index,
+				CommandValid:  false,
+			}
+
+			for !rf.killed() {
+				rf.mu.Lock()
+				if rf.lastApplied <= applyMsg.SnapshotIndex {
+					rf.mu.Unlock()
+					select {
+					case rf.applyCh <- applyMsg:
+						rf.lastApplied = applyMsg.SnapshotIndex
+						rf.applyCond.Signal()
+						return
+					default:
+						time.Sleep(10 * time.Millisecond)
+					}
+				} else {
+					rf.mu.Unlock()
+					return
+				}
+			}
+		}()
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -178,28 +212,52 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
-	if index <= rf.log[0].Index {
-		// Ignore if index is not greater than current snapshotIndex
+	if index <= rf.log[0].Index || index > rf.log[len(rf.log)-1].Index {
+		defer rf.mu.Unlock()
 		return
 	}
 
 	// Update snapshot data
 	rf.snapshot = snapshot
-	// rf.snapshotIndex = index
-	// rf.snapshotTerm = rf.log[index-rf.log[0].Index].Term // Adjust for potential offset in log indexing
+	snapshotIndex := index
+	snapshotTerm := rf.log[index-rf.log[0].Index].Term
 
-	rf.log[0] = LogEntry{
-		Index: index,
-		Term:  rf.log[index-rf.log[1].Index].Term,
-	}
+	newLog := make([]LogEntry, 0)
+	newLog = append(newLog, LogEntry{Index: snapshotIndex, Term: snapshotTerm})
+	newLog = append(newLog, rf.log[index-rf.log[0].Index+1:]...)
 
-	// Discard log entries before index
-	rf.log = rf.log[index-rf.log[0].Index:]
+	rf.log = newLog
 
 	// Persist state and snapshot
 	rf.persist()
+
+	applyMsg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      snapshot,
+		SnapshotTerm:  snapshotTerm,
+		SnapshotIndex: snapshotIndex,
+		CommandValid:  false,
+	}
+	rf.mu.Unlock()
+	go func() {
+		for !rf.killed() {
+			rf.mu.Lock()
+			if rf.lastApplied <= applyMsg.SnapshotIndex {
+				rf.mu.Unlock()
+				select {
+				case rf.applyCh <- applyMsg:
+					// DPrintf("Server: %v -- send snapshot after Client Snapshot call index %v, %v", rf.me, applyMsg.SnapshotIndex, rf.log)
+					return
+				default:
+					// time.Sleep(10 * time.Millisecond)
+				}
+			} else {
+				rf.mu.Unlock()
+				return
+			}
+		}
+	}()
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -218,7 +276,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	index := len(rf.log)
+	index := rf.log[len(rf.log)-1].Index + 1
 	term := rf.currentTerm
 
 	//If not leader, just return false
@@ -278,6 +336,7 @@ func (rf *Raft) ticker() {
 				go rf.candidateState.startElection()
 			}
 		}
+		rf.applyCond.Signal()
 		rf.mu.Unlock()
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
@@ -298,37 +357,80 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	rf.init()
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	rf.readPersist()
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.logSender()
-	go rf.commandApplier(applyCh)
+	go rf.commandApplier()
 	go rf.leaderState.sendHeartbeats()
 
 	return rf
 }
 
-func (rf *Raft) commandApplier(applyCh chan ApplyMsg) {
+func (rf *Raft) commandApplier() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		for rf.commitIndex > rf.lastApplied {
-			rf.lastApplied++
-			applyMsg := ApplyMsg{
-				CommandValid: true,
-				Command:      rf.log[rf.lastApplied].Command,
-				CommandIndex: rf.log[rf.lastApplied].Index,
+		for rf.lastApplied >= rf.commitIndex {
+			rf.applyCond.Wait()
+			if rf.killed() {
+				rf.mu.Unlock()
+				return
 			}
-			applyCh <- applyMsg
 		}
 
+		if rf.lastApplied < rf.log[0].Index {
+			rf.lastApplied = rf.log[0].Index
+		}
+
+		messages := make([]ApplyMsg, 0)
+		currLastApplied := rf.lastApplied
+		for currLastApplied < rf.commitIndex && currLastApplied < rf.log[len(rf.log)-1].Index {
+			currLastApplied++
+			logIndex := currLastApplied - rf.log[0].Index
+			if logIndex < 0 || logIndex > rf.log[len(rf.log)-1].Index {
+				// DPrintf("Invalid log index: %d, log length: %d, SSIndex: %d", logIndex, len(rf.log), rf.log[0].Index)
+				break
+			}
+			entry := rf.log[logIndex]
+			messages = append(messages, ApplyMsg{
+				CommandValid:  true,
+				Command:       entry.Command,
+				CommandIndex:  entry.Index,
+				SnapshotValid: false,
+			})
+		}
 		rf.mu.Unlock()
-		ms := 10
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+
+		for i := 0; i < len(messages); {
+			rf.mu.Lock()
+			if messages[i].CommandIndex == rf.lastApplied+1 {
+				rf.mu.Unlock()
+				select {
+				case rf.applyCh <- messages[i]:
+					rf.mu.Lock()
+					rf.lastApplied = messages[i].CommandIndex
+					rf.mu.Unlock()
+					// DPrintf("%v: CommandApplier -- New LastApplied: %v, index %v, commitIndex: %v", rf.me, rf.lastApplied,
+					// messages[i].CommandIndex, rf.commitIndex)
+					i++
+				default:
+					time.Sleep(10 * time.Millisecond)
+				}
+			} else if messages[i].CommandIndex <= rf.log[0].Index {
+				rf.mu.Unlock()
+				i++
+			} else {
+				rf.mu.Unlock()
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

@@ -1127,6 +1127,7 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 			cfg.one(rand.Int(), servers-1, true)
 		}
 		if crash {
+			DPrintf("----TESTER---- %v is disconnected", victim)
 			cfg.crash1(victim)
 			cfg.one(rand.Int(), servers-1, true)
 		}
@@ -1158,6 +1159,7 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 			leader1 = cfg.checkOneLeader()
 		}
 		if crash {
+			DPrintf("----TESTER---- %v is reconnected", victim)
 			cfg.start1(victim, cfg.applierSnap)
 			cfg.connect(victim)
 			cfg.one(rand.Int(), servers, true)
