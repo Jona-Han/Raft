@@ -31,7 +31,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		reply.Term = rf.currentTerm
-		rf.transitionToFollower()
+		rf.currentState = Follower
 		rf.votedFor = -1
 		changed = true
 	}
@@ -62,7 +62,6 @@ func (rf *Raft) passesElectionRestriction(args *RequestVoteArgs) bool {
 	if (thisLastLog.Term == args.LastLogTerm) && thisLastLog.Index > args.LastLogIndex {
 		return false
 	}
-
 	//else return true
 	return true
 }
@@ -98,14 +97,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.updateLastHeartbeat()
+	rf.heartbeat = true
 
 	// Candidate and got appendEntries from new leader with same term
-	if rf.isCandidate() && args.Term == rf.currentTerm {
-		rf.transitionToFollower()
+	if rf.currentState == Candidate && args.Term == rf.currentTerm {
+		rf.currentState = Follower
 	} else if args.Term > rf.currentTerm { // Any state and got appendEntries from new leader
 		rf.currentTerm = args.Term
-		rf.transitionToFollower()
+		rf.currentState = Follower
 		rf.votedFor = -1
 		rf.persist()
 	}

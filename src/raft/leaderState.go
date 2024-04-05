@@ -10,7 +10,6 @@ type LeaderState struct {
 	nextIndex  map[int]int
 	matchIndex map[int]int
 	cond       *sync.Cond
-	hbCond     *sync.Cond
 }
 
 func (ls *LeaderState) init() {
@@ -34,7 +33,7 @@ func (ls *LeaderState) sendLog(server int) {
 	// While logs are not up to date and successful, continue loop
 	for !ls.rf.killed() {
 		ls.rf.mu.Lock()
-		if !ls.rf.isLeader() {
+		if ls.rf.currentState != Leader {
 			defer ls.rf.mu.Unlock()
 			return
 		}
@@ -80,7 +79,7 @@ func (ls *LeaderState) sendLog(server int) {
 		// If this is stale, then update term and convert to follower
 		if reply.Term > ls.rf.currentTerm {
 			ls.rf.currentTerm = reply.Term
-			ls.rf.transitionToFollower()
+			ls.rf.currentState = Follower
 			ls.rf.votedFor = -1
 			ls.rf.persist()
 			ls.rf.mu.Unlock()
@@ -143,7 +142,7 @@ func (ls *LeaderState) sendSnapshot(server int) {
 		ls.rf.mu.Lock()
 		if reply.Term > ls.rf.currentTerm {
 			ls.rf.currentTerm = reply.Term
-			ls.rf.transitionToFollower()
+			ls.rf.currentState = Follower
 			ls.rf.votedFor = -1
 			ls.rf.persist()
 		}
@@ -184,12 +183,13 @@ func (ls *LeaderState) newCommitMajorityChecker() {
 }
 
 // sendHeartbeats sends heartsbeats to all peers
-func (ls *LeaderState) sendHeartbeats() {
+func (ls *LeaderState) startSendingHeartbeats() {
 	for !ls.rf.killed() {
 		ls.rf.mu.Lock()
 
-		if !ls.rf.isLeader() {
-			ls.hbCond.Wait()
+		if ls.rf.currentState != Leader || ls.rf.killed() {
+			ls.rf.mu.Unlock()
+			return
 		}
 		ls.rf.mu.Unlock()
 
@@ -208,7 +208,7 @@ func (ls *LeaderState) sendHeartbeats() {
 func (ls *LeaderState) sendHeartbeat(server int) {
 	ls.rf.mu.Lock()
 	// If not in leader state anymore, don't send heartbeat
-	if !ls.rf.isLeader() {
+	if ls.rf.currentState != Leader {
 		ls.rf.mu.Unlock()
 		return
 	}
@@ -222,7 +222,6 @@ func (ls *LeaderState) sendHeartbeat(server int) {
 		LeaderCommit: ls.rf.commitIndex,
 	}
 	ls.rf.mu.Unlock()
-
 	reply := AppendEntriesReply{}
 	ok := ls.rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
 
@@ -235,7 +234,7 @@ func (ls *LeaderState) sendHeartbeat(server int) {
 	// If this is stale, then update term and convert to follower
 	if reply.Term > ls.rf.currentTerm {
 		ls.rf.currentTerm = reply.Term
-		ls.rf.transitionToFollower()
+		ls.rf.currentState = Follower
 		ls.rf.votedFor = -1
 		ls.rf.persist()
 	}

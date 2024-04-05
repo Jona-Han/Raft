@@ -31,6 +31,12 @@ import (
 	"cpsc416/labrpc"
 )
 
+const (
+	Follower = iota
+	Candidate
+	Leader
+)
+
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -66,10 +72,11 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	currentState   string
+	currentState   int
 	candidateState CandidateState
-	followerState  FollowerState
 	leaderState    LeaderState
+
+	heartbeat bool
 
 	currentTerm int
 	votedFor    int
@@ -78,7 +85,10 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 
+	lastIncludedIndex int
+	lastIncludedTerm  int
 	snapshot  []byte
+	
 	applyCh   chan ApplyMsg
 	applyCond *sync.Cond
 }
@@ -87,7 +97,7 @@ type Raft struct {
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	term := rf.currentTerm
-	isLeader := rf.isLeader()
+	isLeader := rf.currentState == Leader
 	rf.mu.Unlock()
 	return term, isLeader
 }
@@ -97,25 +107,19 @@ func (rf *Raft) init() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.transitionToFollower()
+	rf.currentState = Follower
 	rf.candidateState = CandidateState{
 		rf:              rf,
 		numOfVotes:      0,
-		electionTimeout: 300,
-	}
-	rf.followerState = FollowerState{
-		rf:                rf,
-		lastHeartbeatTime: time.Now(),
-		heartbeatTimeout:  300,
 	}
 	rf.leaderState = LeaderState{
 		rf:         rf,
 		nextIndex:  make(map[int]int),
 		matchIndex: make(map[int]int),
 		cond:       sync.NewCond(&rf.mu),
-		hbCond:     sync.NewCond(&rf.mu),
 	}
 
+	rf.heartbeat = false
 	rf.votedFor = -1
 	rf.currentTerm = 0
 	rf.commitIndex = 0
@@ -280,7 +284,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := rf.currentTerm
 
 	//If not leader, just return false
-	if !rf.isLeader() {
+	if rf.currentState != Leader {
 		return index, term, false
 	}
 
@@ -309,7 +313,6 @@ func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
 	rf.leaderState.cond.Broadcast()
-	rf.leaderState.hbCond.Broadcast()
 }
 
 func (rf *Raft) killed() bool {
@@ -318,27 +321,18 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-	ms := 300 + (rand.Int63() % 150)
-	time.Sleep(time.Duration(ms) * time.Millisecond)
-
 	for !rf.killed() {
 		// Check if a leader election should be started.
+		ms := 250 + (rand.Int63() % 150)
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+
 		rf.mu.Lock()
-		if rf.isFollower() {
-			// If the server is a follower, check if it has not received any heartbeat for a timeout.
-			if rf.followerState.timedOut() {
-				rf.transitionToCandidate()
-				go rf.candidateState.startElection()
-			}
-		} else if rf.isCandidate() {
-			//Check for timeout
-			if rf.candidateState.timedOut() {
-				go rf.candidateState.startElection()
-			}
+		if !rf.heartbeat && !rf.killed() {
+			go rf.candidateState.startElection()
 		}
+		rf.heartbeat = false
 		rf.applyCond.Signal()
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
@@ -368,7 +362,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 	go rf.logSender()
 	go rf.commandApplier()
-	go rf.leaderState.sendHeartbeats()
 
 	return rf
 }
@@ -438,7 +431,7 @@ func (rf *Raft) logSender() {
 	for !rf.killed() {
 		rf.mu.Lock()
 
-		if !rf.isLeader() {
+		if rf.currentState != Leader {
 			rf.leaderState.cond.Wait()
 		}
 
@@ -447,41 +440,4 @@ func (rf *Raft) logSender() {
 		rf.leaderState.cond.Wait()
 		rf.mu.Unlock()
 	}
-}
-
-// UpdateLastHeartbeat updates the last heartbeat time for the follower state.
-func (rf *Raft) updateLastHeartbeat() {
-	rf.followerState.lastHeartbeatTime = time.Now()
-}
-
-// TransitionToFollower transitions Raft to the follower state.
-func (rf *Raft) transitionToFollower() {
-	rf.currentState = "follower"
-}
-
-// TransitionToCandidate transitions Raft to the candidate state.
-func (rf *Raft) transitionToCandidate() {
-	rf.currentState = "candidate"
-}
-
-// TransitionToLeader transitions Raft to the leader state and starts sending heartbeats if not already started.
-func (rf *Raft) transitionToLeader() {
-	rf.leaderState.init()
-	rf.currentState = "leader"
-	rf.leaderState.hbCond.Signal()
-}
-
-// IsFollower returns true if Raft is in the follower state.
-func (rf *Raft) isFollower() bool {
-	return rf.currentState == "follower"
-}
-
-// IsLeader returns true if Raft is in the leader state.
-func (rf *Raft) isLeader() bool {
-	return rf.currentState == "leader"
-}
-
-// IsCandidate returns true if Raft is in the candidate state.
-func (rf *Raft) isCandidate() bool {
-	return rf.currentState == "candidate"
 }
