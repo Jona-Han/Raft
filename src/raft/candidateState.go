@@ -90,7 +90,7 @@ func (cs *CandidateState) sendRequestVote(server int, args *RequestVoteArgs) {
 			if cs.isElected() {
 				cs.rf.currentState = Leader
 				cs.rf.leaderState.init()
-				// cs.rf.leaderState.cond.Broadcast()
+				cs.rf.leaderState.cond.Broadcast()
 			}
 		}
 		return

@@ -68,12 +68,14 @@ func (ls *LeaderState) sendLog(server int, term int) {
 		lastEntryIndex := ls.rf.log[len(ls.rf.log)-1].Index
 		snapshotIndex := ls.rf.log[0].Index
 
+		// Don't have the required entry in log so send snapshot instead
 		if nextIndex <= snapshotIndex && snapshotIndex != 0 {
 			go ls.sendSnapshot(server, ls.rf.currentTerm)
 			ls.rf.mu.Unlock()
 			return
 		}
 
+		// Follower expects entry past my log so update nextIndex
 		if lastEntryIndex < nextIndex {
 			ls.nextIndex[server] = lastEntryIndex
 			ls.rf.mu.Unlock()
@@ -102,8 +104,8 @@ func (ls *LeaderState) sendLog(server int, term int) {
 
 		ls.rf.mu.Lock()
 
-		if ls.rf.currentState != Leader || ls.rf.currentTerm != term {
-			ls.rf.mu.Unlock()
+		if ls.rf.currentState != Leader || ls.rf.currentTerm != term || ls.rf.currentTerm > term {
+			defer ls.rf.mu.Unlock()
 			return
 		}
 
@@ -117,7 +119,7 @@ func (ls *LeaderState) sendLog(server int, term int) {
 			return
 		}
 		
-		// If log's reply shows out of date, update which logs to send and retry
+		// If log replication was a success
 		if reply.Success {
 			lastLogEntry := len(args.Entries) - 1
 			if lastLogEntry >= 0 {
@@ -133,6 +135,13 @@ func (ls *LeaderState) sendLog(server int, term int) {
 			ls.rf.mu.Unlock()
 			return
 		} else { //Failure
+			//  Case 0: follower asked the leader for a snapshot
+			// 	Case 1: leader doesn't have XTerm:
+			// 		nextIndex = XIndex
+			//  Case 2: leader has XTerm:
+			// 		nextIndex = leader's last entry for XTerm
+			//  Case 3: follower's log is too short:
+			// 		nextIndex = XLen
 			if reply.NeedsSnapshot {
 				ls.nextIndex[server] = ls.rf.log[0].Index
 			} else if reply.XIsShort { //Log too short

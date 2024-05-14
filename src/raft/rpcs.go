@@ -1,5 +1,7 @@
 package raft
 
+import "fmt"
+
 type RequestVoteArgs struct {
 	Term         int
 	CandidateID  int
@@ -111,28 +113,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	snapshotIndex := rf.log[0].Index
 	snapshotTerm := rf.log[0].Term
 	lastLogIndex := rf.log[len(rf.log)-1].Index
-	//My log is too short
-	// if args.PrevLogIndex > lastLogIndex {
-	// 	reply.Term = rf.currentTerm
-	// 	reply.Success = false
-	// 	reply.XIsShort = true
-	// 	reply.XLen = lastLogIndex
-	// 	return
-	// } else if args.PrevLogIndex >= snapshotIndex && rf.log[args.PrevLogIndex-snapshotIndex].Term != args.PrevLogTerm {
-	// 	reply.Term = rf.currentTerm
-	// 	reply.Success = false
-	// 	reply.XTerm = rf.log[args.PrevLogIndex-snapshotIndex].Term
-	// 	reply.XLen = lastLogIndex
 
-	// 	for _, entry := range rf.log {
-	// 		if entry.Term == reply.XTerm {
-	// 			reply.XIndex = entry.Index
-	// 			break
-	// 		}
-	// 	}
-	// 	return
-	// }
-	prevLogIdx := args.PrevLogIndex - snapshotIndex - 1
+
+	//  These are possible cases:
+	//  case 0) if !(0 <= args.PrevIndex <= rf.XIndex + len(rf.logs)), the given args.PrevIndex is out our search space. Then, we tell the leader that our log is short, and ask for a prevLogIndex set to reply.XLen+1. In the next round, we decide about the APE.
+	//	case 1) if the range is in our search space, there is a match if any of these happens:
+	// 		1. if prevLogIdx == -1, i.e. args.PrevIndex is at rf.XIndex, it is a match if args.PrevIndex == rf.XIndex && args.PrevTerm == rf.XTerm
+	//		2. if prevLogIdx >=  0, i.e. args.PrevIndex is in the tail, it is a match if args.PrevIndex == rf.logs[prevLogIdx].Index && args.PrevTerm == rf.logs[prevLogIdx].Term
+	// 	case 2) if we couldn't find a match, then we have to reject the APE. But, we have to fill reply properly
+	//      - find the largest index j such that Term(j) != Term(prevLogIdx), where j<prevLogIdx. Therefore, the j's range is [-2,-1,...,prevLogIdx-1]:
+	//			1. if prevLogIdx == -1 we need a new snapshot because we cannot find such a j, meaning there is no search space for that (see 1.1)
+	// 			2. if j==-2: we need a new snapshot because we couldn't find such a j, i.e. we searched but such j is before our last snapshot
+	// 			3. if j>=-1: set the reply.XIndex=rf.logs[j+1].Index, i.e. we could find the j that satisfies case 2.
+	prevLogIdx := args.PrevLogIndex - snapshotIndex - 1 // 6 0 - 1 = 0
 	if !(args.PrevLogIndex >= snapshotIndex && args.PrevLogIndex <= lastLogIndex) {
 		// case 0) claim that the log is shorter
 		reply.Success = false
@@ -146,6 +139,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		reply.XLen = lastLogIndex
+		fmt.Printf("2.1")
 
 		if prevLogIdx == -1 {
 			// case 2.1
@@ -175,7 +169,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 
-
+	// case 1)
 	// If an existing entry conflicts with a new one (same index but different terms),
 	// delete the existing entry and all that follow it (§5.3)
 	for _, newEntry := range args.Entries {
@@ -195,7 +189,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if len(args.Entries) > 0 {
 		// DPrintf("Follower %v: Finished call to AppendEntries with lastLog: %v", rf.me, rf.log[len(rf.log)-1])
-		rf.persist()
+		defer rf.persist()
 	}
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
