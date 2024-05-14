@@ -181,27 +181,29 @@ func (rf *Raft) readPersist() {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	if index <= rf.log[0].Index || index > rf.log[len(rf.log)-1].Index {
-		defer rf.mu.Unlock()
 		return
 	}
 
 	// Update snapshot data
 	rf.snapshot = snapshot
 	snapshotIndex := index
-	snapshotTerm := rf.log[index-rf.log[0].Index].Term
+	currSnapIndex := rf.log[0].Index
+	snapshotTerm := rf.log[index-currSnapIndex].Term
 
+	// remove all log entries up to the snapIndex and save the snapshot
 	newLog := make([]LogEntry, 0)
 	newLog = append(newLog, LogEntry{Index: snapshotIndex, Term: snapshotTerm})
-	newLog = append(newLog, rf.log[index-rf.log[0].Index+1:]...)
+
+	if xIdx := index - currSnapIndex; xIdx >= 0 && xIdx < len(rf.log) {
+		// I have the log entry; keep entries after
+		newLog = append(newLog, rf.log[index-currSnapIndex+1:]...)
+	}
 
 	rf.log = newLog
-
-	// Persist state and snapshot
-	rf.persist()
-
-	defer rf.mu.Unlock()
 
 	go func() {
 		rf.applyQueue <- struct{}{}

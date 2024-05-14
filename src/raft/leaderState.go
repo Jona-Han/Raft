@@ -62,8 +62,7 @@ func (ls *LeaderState) sendLog(server int, term int) {
 		snapshotIndex := ls.rf.log[0].Index
 
 		if nextIndex <= snapshotIndex && snapshotIndex != 0 {
-			fmt.Printf("SENDING SNAPSHOT?")
-			go ls.sendSnapshot(server)
+			go ls.sendSnapshot(server, ls.rf.currentTerm)
 			ls.rf.mu.Unlock()
 			return
 		}
@@ -155,10 +154,14 @@ func (ls *LeaderState) sendLog(server int, term int) {
 	}
 }
 
-func (ls *LeaderState) sendSnapshot(server int) {
-	DPrintf("%v: -- Leader -- Send snapshot to %v -- lastApplied: %v, commitIndex: %v", ls.rf.me, server, ls.rf.lastApplied, ls.rf.commitIndex)
-	for !ls.rf.killed() {
+func (ls *LeaderState) sendSnapshot(server int, term int) {
+	// for !ls.rf.killed() {
 		ls.rf.mu.Lock()
+		if ls.rf.currentState != Leader || ls.rf.currentTerm > term {
+			defer ls.rf.mu.Unlock()
+			return
+		}
+
 		args := InstallSnapshotArgs{
 			Term:              ls.rf.currentTerm,
 			LeaderId:          ls.rf.me,
@@ -171,11 +174,13 @@ func (ls *LeaderState) sendSnapshot(server int) {
 
 		ok := ls.rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply)
 		if !ok {
-			time.Sleep(10 * time.Millisecond)
-			continue
+			// time.Sleep(10 * time.Millisecond)
+			// continue
+			return
 		}
 
 		ls.rf.mu.Lock()
+		defer ls.rf.mu.Unlock()
 		if reply.Term > ls.rf.currentTerm {
 			ls.rf.currentTerm = reply.Term
 			ls.rf.currentState = Follower
@@ -185,11 +190,13 @@ func (ls *LeaderState) sendSnapshot(server int) {
 		} else if reply.Term != ls.rf.currentTerm {
 			return
 		}
-		ls.nextIndex[server] = args.LastIncludedIndex + 1
-		ls.matchIndex[server] = args.LastIncludedIndex
-		ls.rf.mu.Unlock()
+
+		if reply.Success {
+			ls.matchIndex[server] = max(ls.matchIndex[server], args.LastIncludedIndex)
+			ls.nextIndex[server] = ls.matchIndex[server] + 1
+		}
 		return
-	}
+	// }
 }
 
 func (ls *LeaderState) checkForCommits() {

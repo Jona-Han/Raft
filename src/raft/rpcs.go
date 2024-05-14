@@ -1,7 +1,5 @@
 package raft
 
-import "time"
-
 type RequestVoteArgs struct {
 	Term         int
 	CandidateID  int
@@ -222,7 +220,8 @@ type InstallSnapshotArgs struct {
 }
 
 type InstallSnapshotReply struct {
-	Term int
+	Success bool // if the snapshot installed successfully; for the leader
+	Term    int  // current term of the follower
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
@@ -233,54 +232,37 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return
 	}
 
+	currSnapIndex := rf.log[0].Index
+	currSnapTerm := rf.log[0].Term
+
+	if currSnapIndex > args.LastIncludedIndex {
+		reply.Success = false
+		return
+	} else if currSnapIndex == args.LastIncludedIndex && currSnapTerm == args.LastIncludedTerm {
+		reply.Success = true
+		return
+	}
+	defer rf.persist()
+
 	rf.snapshot = args.Data
 
-	// lastLogIndex := rf.log[len(rf.log)-1].Index
-	// ssIndex := rf.log[0].Index
-	// if args.LastIncludedIndex <= lastLogIndex && args.LastIncludedIndex >= ssIndex &&
-	// 	rf.log[args.LastIncludedIndex-ssIndex].Index == args.LastIncludedIndex &&
-	// 	rf.log[args.LastIncludedIndex-ssIndex].Term == args.LastIncludedTerm {
-
-	// 	rf.log = rf.log[args.LastIncludedIndex-ssIndex:]
-	// 	rf.persist()
-	// 	return
-	// }
-
-	rf.log = make([]LogEntry, 0)
-	rf.log = append(rf.log, LogEntry{
+	newLog := make([]LogEntry, 0)
+	newLog = append(newLog, LogEntry{
 		Index: args.LastIncludedIndex,
 		Term:  args.LastIncludedTerm,
 	})
 
-	rf.persist()
-	// DPrintf("%v: -- RPC handler InstallSnapshot -- %v, lastApplied: %v, commitIndex: %v", rf.me, rf.log[0].Index, rf.lastApplied, rf.commitIndex)
+	idx := args.LastIncludedIndex - currSnapIndex
+	if idx >= 0 && idx < len(rf.log) &&
+	rf.log[idx].Index == args.LastIncludedIndex && rf.log[idx].Term == args.LastIncludedTerm {
+		newLog = append(newLog, rf.log[idx+1:]...)
+	}
+
+	rf.log = newLog
+
+	reply.Success = true
 
 	go func() {
-		applyMsg := ApplyMsg{
-			SnapshotValid: true,
-			Snapshot:      args.Data,
-			SnapshotTerm:  args.LastIncludedTerm,
-			SnapshotIndex: args.LastIncludedIndex,
-			CommandValid:  false,
-		}
-		for !rf.killed() {
-			rf.mu.Lock()
-			if rf.lastApplied <= applyMsg.SnapshotIndex {
-				rf.mu.Unlock()
-				select {
-				case rf.applyCh <- applyMsg:
-					// DPrintf("Snapshot from server %v sent with index %v", rf.me, applyMsg.SnapshotIndex)
-					rf.mu.Lock()
-					rf.lastApplied = applyMsg.SnapshotIndex
-					rf.mu.Unlock()
-					return
-				default:
-					time.Sleep(10 * time.Millisecond)
-				}
-			} else {
-				rf.mu.Unlock()
-				return
-			}
-		}
+		rf.applyQueue <- struct{}{}
 	}()
 }
