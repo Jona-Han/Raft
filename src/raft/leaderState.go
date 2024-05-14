@@ -1,18 +1,22 @@
 package raft
 
+// This file contains all attributes and functions related only to the raft
+// server in its leader state.
+// Includes replication of logs and heartbeats
+
 import (
 	"sync"
 	"time"
-	"fmt"
 )
 
 type LeaderState struct {
-	rf         *Raft
-	nextIndex  map[int]int
-	matchIndex map[int]int
-	cond       *sync.Cond
+	rf         *Raft			// this raft instance
+	nextIndex  map[int]int		// maps the next entry to send to each follower (default length of leader log + 1)
+	matchIndex map[int]int		// maps the last known replicated entry for each follower (default 0)
+	cond       *sync.Cond		// cond for synchronization
 }
 
+// Initializes leader state and routines after winning an election
 func (ls *LeaderState) init() {
 	lastLogIndex := ls.rf.log[len(ls.rf.log)-1].Index
 	for key := range ls.rf.peers {
@@ -23,12 +27,13 @@ func (ls *LeaderState) init() {
 	go ls.logSender(ls.rf.currentTerm)
 }
 
+// Subroutine that triggers the replication of logs to followers
 func (ls *LeaderState) logSender(origTerm int) {
 	for !ls.rf.killed() {
 		ls.rf.mu.Lock()
 
-		if ls.rf.killed() || ls.rf.currentState != Leader || ls.rf.currentTerm > origTerm {
-			ls.rf.mu.Unlock()
+		if ls.rf.currentState != Leader || ls.rf.currentTerm > origTerm {
+			defer ls.rf.mu.Unlock()
 			return
 		}
 
@@ -39,6 +44,7 @@ func (ls *LeaderState) logSender(origTerm int) {
 	}
 }
 
+// Sends log to follower server if last log index is at least next index for that server
 func (ls *LeaderState) sendLogs() {
 	lastLogIndex := ls.rf.log[len(ls.rf.log)-1].Index
 	for server, value := range ls.nextIndex {
@@ -48,6 +54,7 @@ func (ls *LeaderState) sendLogs() {
 	}
 }
 
+// Send logs to server
 func (ls *LeaderState) sendLog(server int, term int) {
 	// While logs are not up to date and successful, continue loop
 	for !ls.rf.killed() {
@@ -73,10 +80,6 @@ func (ls *LeaderState) sendLog(server int, term int) {
 			return
 		}
 
-		if nextIndex == 0 {
-			fmt.Printf("CRITICAL error: nextIndex can't be 0")
-		}
-
 		args := AppendEntriesArgs{
 			Term:         term,
 			LeaderId:     ls.rf.me,
@@ -99,7 +102,7 @@ func (ls *LeaderState) sendLog(server int, term int) {
 
 		ls.rf.mu.Lock()
 
-		if ls.rf.killed() || ls.rf.currentState != Leader || ls.rf.currentTerm != term {
+		if ls.rf.currentState != Leader || ls.rf.currentTerm != term {
 			ls.rf.mu.Unlock()
 			return
 		}
@@ -109,8 +112,8 @@ func (ls *LeaderState) sendLog(server int, term int) {
 			ls.rf.currentTerm = reply.Term
 			ls.rf.currentState = Follower
 			ls.rf.votedFor = -1
-			ls.rf.persist()
-			ls.rf.mu.Unlock()
+			defer ls.rf.persist()
+			defer ls.rf.mu.Unlock()
 			return
 		}
 		
@@ -155,53 +158,49 @@ func (ls *LeaderState) sendLog(server int, term int) {
 }
 
 func (ls *LeaderState) sendSnapshot(server int, term int) {
-	// for !ls.rf.killed() {
-		ls.rf.mu.Lock()
-		if ls.rf.currentState != Leader || ls.rf.currentTerm > term {
-			defer ls.rf.mu.Unlock()
-			return
-		}
-
-		args := InstallSnapshotArgs{
-			Term:              ls.rf.currentTerm,
-			LeaderId:          ls.rf.me,
-			LastIncludedIndex: ls.rf.log[0].Index,
-			LastIncludedTerm:  ls.rf.log[0].Term,
-			Data:              ls.rf.snapshot,
-		}
-		reply := InstallSnapshotReply{}
-		ls.rf.mu.Unlock()
-
-		ok := ls.rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply)
-		if !ok {
-			// time.Sleep(10 * time.Millisecond)
-			// continue
-			return
-		}
-
-		ls.rf.mu.Lock()
+	ls.rf.mu.Lock()
+	if ls.rf.currentState != Leader || ls.rf.currentTerm > term {
 		defer ls.rf.mu.Unlock()
-		if reply.Term > ls.rf.currentTerm {
-			ls.rf.currentTerm = reply.Term
-			ls.rf.currentState = Follower
-			ls.rf.votedFor = -1
-			ls.rf.persist()
-			return
-		} else if reply.Term != ls.rf.currentTerm {
-			return
-		}
-
-		if reply.Success {
-			ls.matchIndex[server] = max(ls.matchIndex[server], args.LastIncludedIndex)
-			ls.nextIndex[server] = ls.matchIndex[server] + 1
-		}
 		return
-	// }
+	}
+
+	args := InstallSnapshotArgs{
+		Term:              ls.rf.currentTerm,
+		LeaderId:          ls.rf.me,
+		LastIncludedIndex: ls.rf.log[0].Index,
+		LastIncludedTerm:  ls.rf.log[0].Term,
+		Data:              ls.rf.snapshot,
+	}
+	reply := InstallSnapshotReply{}
+	ls.rf.mu.Unlock()
+
+	ok := ls.rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply)
+	if !ok {
+		return
+	}
+
+	ls.rf.mu.Lock()
+	defer ls.rf.mu.Unlock()
+	if reply.Term > ls.rf.currentTerm {
+		ls.rf.currentTerm = reply.Term
+		ls.rf.currentState = Follower
+		ls.rf.votedFor = -1
+		defer ls.rf.persist()
+		return
+	} else if reply.Term != ls.rf.currentTerm {
+		return
+	}
+
+	if reply.Success {
+		ls.matchIndex[server] = max(ls.matchIndex[server], args.LastIncludedIndex)
+		ls.nextIndex[server] = ls.matchIndex[server] + 1
+	}
+	return
 }
 
+// If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N,
+// and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4).
 func (ls *LeaderState) checkForCommits() {
-	// If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N,
-	// and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4).
 	maxMatchIndex := 0
 	for _, matchIndex := range ls.matchIndex {
 		if matchIndex > maxMatchIndex {
@@ -225,7 +224,7 @@ func (ls *LeaderState) checkForCommits() {
 	}
 }
 
-// sendHeartbeats sends heartsbeats to all peers
+// Subroutine that continuously sends heartsbeats to all peers
 func (ls *LeaderState) startSendingHeartbeats(origTerm int) {
 	for !ls.rf.killed() {
 		ls.rf.mu.Lock()
@@ -234,11 +233,21 @@ func (ls *LeaderState) startSendingHeartbeats(origTerm int) {
 			ls.rf.mu.Unlock()
 			return
 		}
+
+		args := AppendEntriesArgs{
+			Term:         origTerm,
+			LeaderId:     ls.rf.me,
+			PrevLogIndex: ls.rf.log[len(ls.rf.log)-1].Index,
+			PrevLogTerm:  ls.rf.log[len(ls.rf.log)-1].Term,
+			Entries:      make([]LogEntry, 0),
+			LeaderCommit: ls.rf.commitIndex,
+		}
+
 		ls.rf.mu.Unlock()
 
 		for i := range ls.rf.peers {
 			if i != ls.rf.me {
-				go ls.sendHeartbeat(i)
+				go ls.sendHeartbeat(i, &args)
 			}
 		}
 
@@ -247,26 +256,18 @@ func (ls *LeaderState) startSendingHeartbeats(origTerm int) {
 	}
 }
 
-// sendHeartbeat sends a heartbeat RPC call to the server in param
-func (ls *LeaderState) sendHeartbeat(server int) {
+// Sends a heartbeat RPC call to the server in param
+func (ls *LeaderState) sendHeartbeat(server int, args *AppendEntriesArgs) {
 	ls.rf.mu.Lock()
 	// If not in leader state anymore, don't send heartbeat
-	if ls.rf.currentState != Leader {
+	if ls.rf.currentState != Leader || ls.rf.currentTerm > args.Term {
 		ls.rf.mu.Unlock()
 		return
 	}
 
-	args := AppendEntriesArgs{
-		Term:         ls.rf.currentTerm,
-		LeaderId:     ls.rf.me,
-		PrevLogIndex: ls.rf.log[len(ls.rf.log)-1].Index,
-		PrevLogTerm:  ls.rf.log[len(ls.rf.log)-1].Term,
-		Entries:      make([]LogEntry, 0),
-		LeaderCommit: ls.rf.commitIndex,
-	}
 	ls.rf.mu.Unlock()
 	reply := AppendEntriesReply{}
-	ok := ls.rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
+	ok := ls.rf.peers[server].Call("Raft.AppendEntries", args, &reply)
 
 	if !ok {
 		return

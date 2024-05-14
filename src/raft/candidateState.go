@@ -1,19 +1,23 @@
 package raft
 
+// This file contains all attributes and functions related only to the raft
+// server in its candidate state.
+// Includes election checks
+
 import (
 	"time"
 )
 
 type CandidateState struct {
-	rf                *Raft
-	numOfVotes        int
+	rf                *Raft		// this raft instance
+	numOfVotes        int		// number of votes received during an election
 }
 
-// startElection initiates an election for a raft server
+// Initiates an election for a raft server
 func (cs *CandidateState) startElection() {
 	cs.rf.mu.Lock()
 
-	if cs.rf.currentState == Leader || cs.rf.killed() {
+	if cs.rf.currentState == Leader {
 		cs.rf.mu.Unlock()
 		return
 	}
@@ -47,22 +51,13 @@ func (cs *CandidateState) isElected() bool {
 }
 
 
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
+// sends a request vote rpc call to the server in params
+// requests a vote from
 func (cs *CandidateState) sendRequestVote(server int, args *RequestVoteArgs) {
 	for !cs.rf.killed() {
 		cs.rf.mu.Lock()
 		// If not a candidate or not in the expected voting term, stop vote request
-		if cs.rf.currentState != Candidate || cs.rf.currentTerm != args.Term {
+		if cs.rf.currentState != Candidate || cs.rf.currentTerm > args.Term {
 			cs.rf.mu.Unlock()
 			return
 		}
@@ -85,18 +80,17 @@ func (cs *CandidateState) sendRequestVote(server int, args *RequestVoteArgs) {
 			cs.rf.currentState = Follower
 			cs.rf.votedFor = -1
 			cs.rf.persist()
-			return
-		}
 
 		// Else if vote granted and this is still the same election then update numOfvotes
-		if cs.rf.currentState == Candidate && args.Term == cs.rf.currentTerm {
-			if reply.VoteGranted {
-				cs.numOfVotes += 1
-				if cs.isElected() {
-					cs.rf.currentState = Leader
-					cs.rf.leaderState.init()
-					cs.rf.leaderState.cond.Broadcast()
-				}
+		} else if reply.VoteGranted && 
+		cs.rf.currentState == Candidate && 
+		args.Term == cs.rf.currentTerm {
+
+			cs.numOfVotes += 1
+			if cs.isElected() {
+				cs.rf.currentState = Leader
+				cs.rf.leaderState.init()
+				// cs.rf.leaderState.cond.Broadcast()
 			}
 		}
 		return

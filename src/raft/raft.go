@@ -38,14 +38,10 @@ const (
 )
 
 // as each Raft peer becomes aware that successive log entries are
-// committed, the peer should send an ApplyMsg to the service (or
+// committed, the peer sends an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
 // CommandValid to true to indicate that the ApplyMsg contains a newly
 // committed log entry.
-//
-// in part 2D you'll want to send other kinds of messages (e.g.,
-// snapshots) on the applyCh, but set CommandValid to false for these
-// other uses.
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -72,28 +68,28 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
+	logger *Logger
+
 	currentState   int
 	candidateState CandidateState
 	leaderState    LeaderState
 
-	logger *Logger
+	heartbeat bool				// keeps track of the last heartbeat
 
-	heartbeat bool
+	currentTerm int				// current term at this Raft
+	votedFor    int				// the peer this Raft voted for during the last election
+	log         []LogEntry		// the logs of the current Raft
 
-	currentTerm int
-	votedFor    int
-	log         []LogEntry
+	commitIndex int				// index of highest log entry known to be commited (initalized to be 0)
+	lastApplied int				// index of highes log entry known to be applied to the SM (initalized to be 0)
 
-	commitIndex int
-	lastApplied int
-
-	snapshot  []byte
+	snapshot  []byte			// latest snapshot, snapshot index at log[0].Index, term at log[0].Term
 	
-	applyCh   chan ApplyMsg
-	applyQueue chan struct{}
+	applyCh   chan ApplyMsg		// channel to pass results to the server
+	applyQueue chan struct{}	// channel to signal commandApplier
 }
 
-// return currentTerm and whether this server believes it is the leader.
+// Returns currentTerm and whether this server believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	term := rf.currentTerm
@@ -134,13 +130,8 @@ func (rf *Raft) init() {
 	}
 }
 
-// save Raft's persistent state to stable storage,
+// Saves Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-// before you've implemented snapshots, you should pass nil as the
-// second argument to persister.Save().
-// after you've implemented snapshots, pass the current snapshot
-// (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -152,7 +143,7 @@ func (rf *Raft) persist() {
 	rf.persister.Save(raftstate, rf.snapshot)
 }
 
-// restore previously persisted state.
+// Restores previously persisted state.
 func (rf *Raft) readPersist() {
 	data := rf.persister.ReadRaftState()
 	if rf.persister.RaftStateSize() > 0 { // bootstrap without any state?
@@ -177,10 +168,10 @@ func (rf *Raft) readPersist() {
 	rf.snapshot = rf.persister.ReadSnapshot()
 }
 
-// the service says it has created a snapshot that has
+// The service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
+// that index. Raft now trims its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -253,11 +244,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
 // need for a lock.
-//
-// the issue is that long-running goroutines use memory and may chew
-// up CPU time, perhaps causing later tests to fail and generating
-// confusing debug output. any goroutine with a long-running loop
-// should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
@@ -265,14 +251,17 @@ func (rf *Raft) Kill() {
 	rf.applyQueue <- struct{}{}
 }
 
+// returns whether the raft instance has been killed by the tester
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
 }
 
+
+// subroutine that checks for heartbeat timeout and starts election
+// if no heartbeat occurred between successive checks
 func (rf *Raft) ticker() {
 	for !rf.killed() {
-		// Check if a leader election should be started.
 		ms := 250 + (rand.Int63() % 200)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
@@ -314,7 +303,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist()
 
-	// start ticker goroutine to start elections
+	// start goroutines
 	go rf.ticker()
 	go rf.commandApplier()
 

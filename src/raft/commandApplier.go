@@ -1,7 +1,9 @@
 package raft
 
+// Subroutine that continously checks if there are any new snapshot/log entries that
+// should be sent to the service
 func (rf *Raft) commandApplier() {
-	var lastApplied, commitIndex, XIndex int
+	var lastApplied, commitIndex, snapIndex int
 	var start, end int
 	var logCpy []LogEntry
 
@@ -9,11 +11,7 @@ func (rf *Raft) commandApplier() {
 		<-rf.applyQueue
 
 		rf.mu.Lock()
-		if rf.killed() {
-			defer rf.mu.Unlock()
-			return
-		}
-
+		// If last applied is less than current snapshot, then send snapshot
 		if len(rf.snapshot) > 0 && rf.lastApplied <= rf.log[0].Index {
 			rf.applyCh <- ApplyMsg{
 				SnapshotValid: true,
@@ -24,17 +22,14 @@ func (rf *Raft) commandApplier() {
 		}
 
 		logCpy = logCpy[:0] // empty the log
+		lastApplied, commitIndex, snapIndex = rf.lastApplied, rf.commitIndex, rf.log[0].Index
 
-		lastApplied, commitIndex, XIndex = rf.lastApplied, rf.commitIndex, rf.log[0].Index
+		// Check to update lastApplie and commitIndex
+		lastApplied = max(lastApplied, snapIndex)
+		commitIndex = max(commitIndex, snapIndex)
 
-		if lastApplied < XIndex {
-			lastApplied = max(lastApplied, XIndex)
-		}
-		if commitIndex < XIndex {
-			commitIndex = max(commitIndex, XIndex)
-		}
-		start = lastApplied - XIndex + 1
-		end = commitIndex - XIndex
+		start = lastApplied - snapIndex + 1
+		end = commitIndex - snapIndex
 
 		if start <= end {
 			logCpy = make([]LogEntry, end-start+1)
@@ -42,6 +37,7 @@ func (rf *Raft) commandApplier() {
 		}
 		rf.mu.Unlock()
 
+		// If there are new log entries committed, then send to service
 		if len(logCpy) > 0 {
 			for _, entry := range logCpy {
 				rf.applyCh <- ApplyMsg{
