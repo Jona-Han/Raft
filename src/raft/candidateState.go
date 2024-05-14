@@ -62,7 +62,7 @@ func (cs *CandidateState) sendRequestVote(server int, args *RequestVoteArgs) {
 	for !cs.rf.killed() {
 		cs.rf.mu.Lock()
 		// If not a candidate or not in the expected voting term, stop vote request
-		if cs.rf.currentState != Candidate || cs.rf.currentTerm != args.Term || cs.rf.killed() {
+		if cs.rf.currentState != Candidate || cs.rf.currentTerm != args.Term {
 			cs.rf.mu.Unlock()
 			return
 		}

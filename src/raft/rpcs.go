@@ -36,7 +36,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		changed = true
 	}
 
-	// Else if this hasn't voted for anything this term or has already tried to vote for the candidate,
+	// If this hasn't voted for anything this term or has already tried to vote for the candidate,
 	// then check to grant vote
 	if (rf.votedFor < 0 ||
 		rf.votedFor == args.CandidateID) &&
@@ -84,6 +84,7 @@ type AppendEntriesReply struct {
 	XLen   int
 
 	NeedsSnapshot bool
+	XIsShort bool
 }
 
 // AppendEntries RPC handler
@@ -111,27 +112,71 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 	snapshotIndex := rf.log[0].Index
 	lastLogIndex := rf.log[len(rf.log)-1].Index
-	if args.PrevLogIndex > lastLogIndex {
-		reply.Term = rf.currentTerm
+	//My log is too short
+	// if args.PrevLogIndex > lastLogIndex {
+	// 	reply.Term = rf.currentTerm
+	// 	reply.Success = false
+	// 	reply.XIsShort = true
+	// 	reply.XLen = lastLogIndex
+	// 	return
+	// } else if args.PrevLogIndex >= snapshotIndex && rf.log[args.PrevLogIndex-snapshotIndex].Term != args.PrevLogTerm {
+	// 	reply.Term = rf.currentTerm
+	// 	reply.Success = false
+	// 	reply.XTerm = rf.log[args.PrevLogIndex-snapshotIndex].Term
+	// 	reply.XLen = lastLogIndex
+
+	// 	for _, entry := range rf.log {
+	// 		if entry.Term == reply.XTerm {
+	// 			reply.XIndex = entry.Index
+	// 			break
+	// 		}
+	// 	}
+	// 	return
+	// }
+	prevLogIdx := args.PrevLogIndex - snapshotIndex - 1
+	if !(args.PrevLogIndex >= snapshotIndex && args.PrevLogIndex <= lastLogIndex) {
+		// case 0) claim that the log is shorter
 		reply.Success = false
-		reply.XTerm = 0
-		reply.XIndex = 0
+		reply.Term = rf.currentTerm
+		reply.XIsShort = true
 		reply.XLen = lastLogIndex
 		return
-	} else if args.PrevLogIndex >= snapshotIndex && rf.log[args.PrevLogIndex-snapshotIndex].Term != args.PrevLogTerm {
-		reply.Term = rf.currentTerm
+	} else if !(prevLogIdx == -1 && args.PrevLogIndex == snapshotIndex && args.PrevLogTerm == rf.log[0].Term) && 
+		!(prevLogIdx >= 0 && args.PrevLogIndex == rf.log[prevLogIdx+1].Index && args.PrevLogTerm == rf.log[prevLogIdx+1].Term) {
+		// if it is not case 1), so we are in case 2)
 		reply.Success = false
-		reply.XTerm = rf.log[args.PrevLogIndex-snapshotIndex].Term
+		reply.Term = rf.currentTerm
 		reply.XLen = lastLogIndex
 
-		for _, entry := range rf.log {
-			if entry.Term == reply.XTerm {
-				reply.XIndex = entry.Index
+		if prevLogIdx == -1 {
+			// case 2.1
+			reply.NeedsSnapshot = true
+			return
+		}
+
+		j := prevLogIdx - 1
+		for j >= 0 {
+			if (j >= 1 && rf.log[j].Term != rf.log[prevLogIdx].Term) || (j == 0 && rf.log[0].Term != args.PrevLogTerm) {
 				break
 			}
+			j -= 1
 		}
+
+		if j == -1 {
+			// case 2.2
+			reply.NeedsSnapshot = true
+			return
+		}
+
+		// case 2.3
+		reply.XIndex = rf.log[j+1].Index
+		reply.XTerm = rf.log[j+1].Term
+
 		return
 	}
+
+
+
 	// If an existing entry conflicts with a new one (same index but different terms),
 	// delete the existing entry and all that follow it (§5.3)
 	for _, newEntry := range args.Entries {
@@ -149,25 +194,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log = append(rf.log, newEntry)
 		}
 	}
+	if len(args.Entries) != 0 {
+		// DPrintf("Follower %v: Finished call to AppendEntries with lastLog: %v", rf.me, rf.log[len(rf.log)-1])
+		rf.persist()
+	}
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-	hb := false
 	if args.LeaderCommit > rf.commitIndex {
-		if len(args.Entries) == 0 {
-			rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex)
-			hb = true
-		} else {
-			rf.commitIndex = min(args.LeaderCommit, args.Entries[len(args.Entries)-1].Index)
-		}
+		rf.commitIndex = min(args.LeaderCommit, rf.log[len(rf.log) - 1].Index)
 	}
 	rf.applyCond.Signal()
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
-	if !hb {
-		// DPrintf("Follower %v: Finished call to AppendEntries with lastLog: %v", rf.me, rf.log[len(rf.log)-1])
-		rf.persist()
-	}
 }
 
 type InstallSnapshotArgs struct {

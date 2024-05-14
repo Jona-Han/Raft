@@ -3,6 +3,7 @@ package raft
 import (
 	"sync"
 	"time"
+	"fmt"
 )
 
 type LeaderState struct {
@@ -24,16 +25,16 @@ func (ls *LeaderState) sendLogs() {
 	lastLogIndex := ls.rf.log[len(ls.rf.log)-1].Index
 	for server, value := range ls.nextIndex {
 		if server != ls.rf.me && lastLogIndex >= value {
-			go ls.sendLog(server)
+			go ls.sendLog(server, ls.rf.currentTerm)
 		}
 	}
 }
 
-func (ls *LeaderState) sendLog(server int) {
+func (ls *LeaderState) sendLog(server int, term int) {
 	// While logs are not up to date and successful, continue loop
 	for !ls.rf.killed() {
 		ls.rf.mu.Lock()
-		if ls.rf.currentState != Leader {
+		if ls.rf.currentState != Leader || ls.rf.currentTerm > term {
 			defer ls.rf.mu.Unlock()
 			return
 		}
@@ -42,9 +43,9 @@ func (ls *LeaderState) sendLog(server int) {
 		lastEntryIndex := ls.rf.log[len(ls.rf.log)-1].Index
 		snapshotIndex := ls.rf.log[0].Index
 
-		if nextIndex <= snapshotIndex {
+		if nextIndex <= snapshotIndex && snapshotIndex != 0 {
+			go ls.sendSnapshot(server)
 			ls.rf.mu.Unlock()
-			ls.sendSnapshot(server)
 			return
 		}
 
@@ -52,6 +53,10 @@ func (ls *LeaderState) sendLog(server int) {
 			ls.nextIndex[server] = lastEntryIndex
 			ls.rf.mu.Unlock()
 			return
+		}
+
+		if nextIndex == 0 {
+			fmt.Printf("CRITICAL error: nextIndex can't be 0")
 		}
 
 		args := AppendEntriesArgs{
@@ -70,11 +75,16 @@ func (ls *LeaderState) sendLog(server int) {
 		ok := ls.rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
 
 		if !ok {
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 
 		ls.rf.mu.Lock()
+
+		if ls.rf.killed() || ls.rf.currentState != Leader || ls.rf.currentTerm != args.Term {
+			ls.rf.mu.Unlock()
+			return
+		}
 
 		// If this is stale, then update term and convert to follower
 		if reply.Term > ls.rf.currentTerm {
@@ -85,7 +95,7 @@ func (ls *LeaderState) sendLog(server int) {
 			ls.rf.mu.Unlock()
 			return
 		}
-
+		
 		// If log's reply shows out of date, update which logs to send and retry
 		if reply.Success {
 			lastLogEntry := len(args.Entries) - 1
@@ -97,8 +107,10 @@ func (ls *LeaderState) sendLog(server int) {
 			ls.rf.mu.Unlock()
 			return
 		} else { //Failure
-			if reply.XIndex == 0 { //Log too short
-				ls.nextIndex[server] = max(1, reply.XLen+1)
+			if reply.NeedsSnapshot {
+				ls.nextIndex[server] = ls.rf.log[0].Index
+			} else if reply.XIsShort { //Log too short
+				ls.nextIndex[server] = reply.XLen+1
 			} else {
 				XTermLastIndex := -1
 				for _, entry := range ls.rf.log {
@@ -135,7 +147,7 @@ func (ls *LeaderState) sendSnapshot(server int) {
 
 		ok := ls.rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply)
 		if !ok {
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 
@@ -145,6 +157,9 @@ func (ls *LeaderState) sendSnapshot(server int) {
 			ls.rf.currentState = Follower
 			ls.rf.votedFor = -1
 			ls.rf.persist()
+			return
+		} else if reply.Term != ls.rf.currentTerm {
+			return
 		}
 		ls.nextIndex[server] = args.LastIncludedIndex + 1
 		ls.matchIndex[server] = args.LastIncludedIndex
@@ -187,7 +202,7 @@ func (ls *LeaderState) startSendingHeartbeats() {
 	for !ls.rf.killed() {
 		ls.rf.mu.Lock()
 
-		if ls.rf.currentState != Leader || ls.rf.killed() {
+		if ls.rf.currentState != Leader {
 			ls.rf.mu.Unlock()
 			return
 		}

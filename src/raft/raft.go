@@ -85,8 +85,6 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 
-	lastIncludedIndex int
-	lastIncludedTerm  int
 	snapshot  []byte
 	
 	applyCh   chan ApplyMsg
@@ -158,8 +156,7 @@ func (rf *Raft) readPersist() {
 	if rf.persister.RaftStateSize() > 0 { // bootstrap without any state?
 		r := bytes.NewBuffer(data)
 		d := labgob.NewDecoder(r)
-		var currentTerm int
-		var votedFor int
+		var currentTerm, votedFor int
 		var log []LogEntry
 
 		if d.Decode(&currentTerm) != nil ||
@@ -176,14 +173,16 @@ func (rf *Raft) readPersist() {
 		rf.log = log
 	}
 
-	snapshot := rf.persister.ReadSnapshot()
-	if rf.persister.SnapshotSize() > 0 {
-		rf.snapshot = snapshot
+	if rf.persister.SnapshotSize() > 0 && rf.log[0].Index <= 0 || rf.persister.SnapshotSize() == 0 && rf.log[0].Index > 0 {
+		fmt.Println("FATAL ERROR: Snapshot and snapshot index don't match")
+		return
+	} else if rf.persister.SnapshotSize() > 0 {
+		rf.snapshot = rf.persister.ReadSnapshot()
 
 		go func() {
 			applyMsg := ApplyMsg{
 				SnapshotValid: true,
-				Snapshot:      snapshot,
+				Snapshot:      rf.snapshot,
 				SnapshotTerm:  rf.log[0].Term,
 				SnapshotIndex: rf.log[0].Index,
 				CommandValid:  false,
