@@ -95,6 +95,7 @@ func (cs *CandidateState) sendRequestVote(server int, args *RequestVoteArgs) {
 				if cs.isElected() {
 					cs.rf.leaderState.init()
 					cs.rf.currentState = Leader
+					cs.rf.leaderState.cond.Broadcast()
 					go cs.rf.leaderState.startSendingHeartbeats()
 				}
 			}

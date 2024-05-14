@@ -44,6 +44,7 @@ func (ls *LeaderState) sendLog(server int, term int) {
 		snapshotIndex := ls.rf.log[0].Index
 
 		if nextIndex <= snapshotIndex && snapshotIndex != 0 {
+			fmt.Printf("SENDING SNAPSHOT?")
 			go ls.sendSnapshot(server)
 			ls.rf.mu.Unlock()
 			return
@@ -104,6 +105,11 @@ func (ls *LeaderState) sendLog(server int, term int) {
 				ls.matchIndex[server] = args.Entries[lastLogEntry].Index
 				go ls.newCommitMajorityChecker()
 			}
+
+			go func() {
+				ls.rf.applyQueue <- struct{}{}
+			}()
+
 			ls.rf.mu.Unlock()
 			return
 		} else { //Failure
@@ -190,7 +196,6 @@ func (ls *LeaderState) newCommitMajorityChecker() {
 		if count > len(ls.matchIndex)/2 &&
 			ls.rf.log[n-snapshotIndex].Term == ls.rf.currentTerm {
 			ls.rf.commitIndex = n
-			ls.rf.applyCond.Signal()
 			break
 		}
 	}

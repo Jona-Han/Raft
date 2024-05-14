@@ -111,6 +111,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 	snapshotIndex := rf.log[0].Index
+	snapshotTerm := rf.log[0].Term
 	lastLogIndex := rf.log[len(rf.log)-1].Index
 	//My log is too short
 	// if args.PrevLogIndex > lastLogIndex {
@@ -141,7 +142,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XIsShort = true
 		reply.XLen = lastLogIndex
 		return
-	} else if !(prevLogIdx == -1 && args.PrevLogIndex == snapshotIndex && args.PrevLogTerm == rf.log[0].Term) && 
+	} else if !(prevLogIdx == -1 && args.PrevLogIndex == snapshotIndex && args.PrevLogTerm == snapshotTerm) && 
 		!(prevLogIdx >= 0 && args.PrevLogIndex == rf.log[prevLogIdx+1].Index && args.PrevLogTerm == rf.log[prevLogIdx+1].Term) {
 		// if it is not case 1), so we are in case 2)
 		reply.Success = false
@@ -156,7 +157,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		j := prevLogIdx - 1
 		for j >= 0 {
-			if (j >= 1 && rf.log[j].Term != rf.log[prevLogIdx].Term) || (j == 0 && rf.log[0].Term != args.PrevLogTerm) {
+			if (j >= 1 && rf.log[j].Term != rf.log[prevLogIdx].Term) || (j == 0 && snapshotTerm != args.PrevLogTerm) {
 				break
 			}
 			j -= 1
@@ -194,7 +195,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log = append(rf.log, newEntry)
 		}
 	}
-	if len(args.Entries) != 0 {
+	if len(args.Entries) > 0 {
 		// DPrintf("Follower %v: Finished call to AppendEntries with lastLog: %v", rf.me, rf.log[len(rf.log)-1])
 		rf.persist()
 	}
@@ -203,7 +204,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, rf.log[len(rf.log) - 1].Index)
 	}
-	rf.applyCond.Signal()
+
+	go func() {
+		rf.applyQueue <- struct{}{}
+	}()
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
