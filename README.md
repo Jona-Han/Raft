@@ -78,7 +78,7 @@ To prevent the log from growing indefinitely, Raft uses snapshots to compact the
 
 1. **Clone the Repository:**
     ```sh
-    git clone xxx
+    git clone https://github.com/Jona-Han/raft.git
     cd raft-consensus-algorithm
     ```
 
@@ -104,8 +104,3 @@ To prevent the log from growing indefinitely, Raft uses snapshots to compact the
     ```sh
     go test
     ```
-
-
-## Acknowledgments
-
-The project is based on tests and rpc packages written by Arpan Gujarati at The University of British Columbia. The Raft code is written to pass such tests as part of an assignment.
