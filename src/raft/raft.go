@@ -76,6 +76,8 @@ type Raft struct {
 	candidateState CandidateState
 	leaderState    LeaderState
 
+	logger *Logger
+
 	heartbeat bool
 
 	currentTerm int
@@ -299,6 +301,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.applyCh = applyCh
+
+	logger, err := NewLogger(me)
+	if err != nil {
+		fmt.Println("Couldn't open the log file", err)
+	}
+	rf.logger = logger
+
 
 	rf.init()
 
