@@ -19,6 +19,24 @@ func (ls *LeaderState) init() {
 		ls.nextIndex[key] = lastLogIndex + 1
 		ls.matchIndex[key] = 0
 	}
+	go ls.startSendingHeartbeats(ls.rf.currentTerm)
+	go ls.logSender(ls.rf.currentTerm)
+}
+
+func (ls *LeaderState) logSender(origTerm int) {
+	for !ls.rf.killed() {
+		ls.rf.mu.Lock()
+
+		if ls.rf.killed() || ls.rf.currentState != Leader || ls.rf.currentTerm > origTerm {
+			ls.rf.mu.Unlock()
+			return
+		}
+
+		// Send logs
+		ls.sendLogs()
+		ls.cond.Wait()
+		ls.rf.mu.Unlock()
+	}
 }
 
 func (ls *LeaderState) sendLogs() {
@@ -61,7 +79,7 @@ func (ls *LeaderState) sendLog(server int, term int) {
 		}
 
 		args := AppendEntriesArgs{
-			Term:         ls.rf.currentTerm,
+			Term:         term,
 			LeaderId:     ls.rf.me,
 			PrevLogIndex: nextIndex - 1,
 			PrevLogTerm:  ls.rf.log[nextIndex-snapshotIndex-1].Term,
@@ -82,7 +100,7 @@ func (ls *LeaderState) sendLog(server int, term int) {
 
 		ls.rf.mu.Lock()
 
-		if ls.rf.killed() || ls.rf.currentState != Leader || ls.rf.currentTerm != args.Term {
+		if ls.rf.killed() || ls.rf.currentState != Leader || ls.rf.currentTerm != term {
 			ls.rf.mu.Unlock()
 			return
 		}
@@ -103,7 +121,7 @@ func (ls *LeaderState) sendLog(server int, term int) {
 			if lastLogEntry >= 0 {
 				ls.nextIndex[server] = args.Entries[lastLogEntry].Index + 1
 				ls.matchIndex[server] = args.Entries[lastLogEntry].Index
-				go ls.newCommitMajorityChecker()
+				ls.checkForCommits()
 			}
 
 			go func() {
@@ -174,10 +192,9 @@ func (ls *LeaderState) sendSnapshot(server int) {
 	}
 }
 
-func (ls *LeaderState) newCommitMajorityChecker() {
+func (ls *LeaderState) checkForCommits() {
 	// If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N,
 	// and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4).
-	ls.rf.mu.Lock()
 	maxMatchIndex := 0
 	for _, matchIndex := range ls.matchIndex {
 		if matchIndex > maxMatchIndex {
@@ -199,15 +216,14 @@ func (ls *LeaderState) newCommitMajorityChecker() {
 			break
 		}
 	}
-	ls.rf.mu.Unlock()
 }
 
 // sendHeartbeats sends heartsbeats to all peers
-func (ls *LeaderState) startSendingHeartbeats() {
+func (ls *LeaderState) startSendingHeartbeats(origTerm int) {
 	for !ls.rf.killed() {
 		ls.rf.mu.Lock()
 
-		if ls.rf.currentState != Leader {
+		if ls.rf.currentState != Leader || ls.rf.currentTerm > origTerm {
 			ls.rf.mu.Unlock()
 			return
 		}
@@ -219,7 +235,7 @@ func (ls *LeaderState) startSendingHeartbeats() {
 			}
 		}
 
-		heartbeatSleepTime := 100
+		heartbeatSleepTime := 200
 		time.Sleep(time.Duration(heartbeatSleepTime) * time.Millisecond)
 	}
 }

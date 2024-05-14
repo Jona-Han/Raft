@@ -201,39 +201,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Persist state and snapshot
 	rf.persist()
 
-	// applyMsg := ApplyMsg{
-	// 	SnapshotValid: true,
-	// 	Snapshot:      snapshot,
-	// 	SnapshotTerm:  snapshotTerm,
-	// 	SnapshotIndex: snapshotIndex,
-	// 	CommandValid:  false,
-	// }
 	defer rf.mu.Unlock()
 
 	go func() {
 		rf.applyQueue <- struct{}{}
 	}()
-
-
-
-	// go func() {
-	// 	for !rf.killed() {
-	// 		rf.mu.Lock()
-	// 		if rf.lastApplied <= applyMsg.SnapshotIndex {
-	// 			rf.mu.Unlock()
-	// 			select {
-	// 			case rf.applyCh <- applyMsg:
-	// 				// DPrintf("Server: %v -- send snapshot after Client Snapshot call index %v, %v", rf.me, applyMsg.SnapshotIndex, rf.log)
-	// 				return
-	// 			default:
-	// 				// time.Sleep(10 * time.Millisecond)
-	// 			}
-	// 		} else {
-	// 			rf.mu.Unlock()
-	// 			return
-	// 		}
-	// 	}
-	// }()
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -269,6 +241,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, newEntry)
 	rf.leaderState.cond.Broadcast()
 	rf.persist()
+	
 	return index, term, true
 }
 
@@ -285,6 +258,7 @@ func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
 	rf.leaderState.cond.Broadcast()
+	rf.applyQueue <- struct{}{}
 }
 
 func (rf *Raft) killed() bool {
@@ -303,9 +277,6 @@ func (rf *Raft) ticker() {
 			go rf.candidateState.startElection()
 		}
 		rf.heartbeat = false
-		go func() {
-			rf.applyQueue <- struct{}{}
-		}()
 		rf.mu.Unlock()
 	}
 }
@@ -334,23 +305,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	go rf.logSender()
 	go rf.commandApplier()
 
 	return rf
-}
-
-func (rf *Raft) logSender() {
-	for !rf.killed() {
-		rf.mu.Lock()
-
-		if rf.currentState != Leader {
-			rf.leaderState.cond.Wait()
-		}
-
-		// Send logs
-		rf.leaderState.sendLogs()
-		rf.leaderState.cond.Wait()
-		rf.mu.Unlock()
-	}
 }
