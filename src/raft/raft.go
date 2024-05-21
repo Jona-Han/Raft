@@ -18,10 +18,8 @@ package raft
 //
 
 import (
-	//	"bytes"
 	"bytes"
 	"fmt"
-	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,12 +71,14 @@ type Raft struct {
 	logger *Logger
 
 	currentState   int
-	candidateState CandidateState
-	leaderState    LeaderState
-
+	leaderState    *LeaderState
 	leaderNotifyChan []chan int
 
-	heartbeat bool				// keeps track of the last heartbeat
+	electionTimer            *time.Ticker
+	electionTimeout          time.Duration
+
+	heartBeatTimeout         time.Duration
+	heartBeatTicker 		[]*time.Ticker
 
 	currentTerm int				// current term at this Raft
 	votedFor    int				// the peer this Raft voted for during the last election
@@ -109,17 +109,12 @@ func (rf *Raft) init() {
 	defer rf.mu.Unlock()
 
 	rf.currentState = Follower
-	rf.candidateState = CandidateState{
-		rf:              rf,
-		numOfVotes:      0,
-	}
-	rf.leaderState = LeaderState{
+	rf.leaderState = &LeaderState{
 		rf:         rf,
 		nextIndex:  make(map[int]int),
 		matchIndex: make(map[int]int),
 	}
 
-	rf.heartbeat = false
 	rf.votedFor = -1
 	rf.currentTerm = 0
 	rf.commitIndex = 0
@@ -134,6 +129,8 @@ func (rf *Raft) init() {
 		Index: 0,
 		Term:  0,
 	}
+	rf.electionTimeout = time.Millisecond * 300
+	rf.electionTimer = time.NewTicker(GetRandomTimeout(rf.electionTimeout))
 }
 
 // Saves Raft's persistent state to stable storage,
@@ -187,10 +184,8 @@ func (rf *Raft) readPersist() {
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist()
 
 	snapIndex := rf.log[0].Index
-
 	if index <= snapIndex {
 		return
 	}
@@ -289,21 +284,98 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) sendRequestVote(voteChan chan bool, server int, args *RequestVoteArgs) {
+	reply := RequestVoteReply{}
+
+	ok := rf.peers[server].Call("Raft.RequestVote", args, &reply)
+
+	if !ok || !reply.VoteGranted {
+		voteChan <- false
+		if ok && reply.Term > args.Term {
+			rf.mu.Lock()
+			if rf.currentTerm < reply.Term {
+				rf.currentTerm = reply.Term
+				rf.transitionToFollower(-1)
+			}
+			rf.mu.Unlock()
+		}
+	} else {
+		voteChan <- true
+	}
+}
 
 // subroutine that checks for heartbeat timeout and starts election
 // if no heartbeat occurred between successive checks
 func (rf *Raft) ticker() {
 	for !rf.killed() {
-		ms := 150 + (rand.Int63() % 100)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
-
+		<-rf.electionTimer.C
 		rf.mu.Lock()
-		if rf.currentState != Leader && !rf.heartbeat {
-			rf.candidateState.startElection()
+		if rf.currentState == Leader {
+			rf.electionTimer.Stop()
+			rf.mu.Unlock()
+			continue
 		}
-		rf.heartbeat = false
+		rf.currentTerm++
+		rf.currentState = Candidate
+		rf.votedFor = rf.me
+
+		lastLogTerm := rf.log[len(rf.log)-1].Term
+		lastLogIndex := rf.log[len(rf.log)-1].Index
+		args := RequestVoteArgs{
+			Term:         rf.currentTerm,
+			CandidateID:  rf.me,
+			LastLogTerm:  lastLogTerm,
+			LastLogIndex: lastLogIndex,
+		}
+
+		rf.electionTimer.Reset(GetRandomTimeout(rf.electionTimeout))
 		rf.mu.Unlock()
+		go func() {
+			voteChan := make(chan bool, len(rf.peers))
+			for idx, _ := range rf.peers {
+				if idx != rf.me {
+					go rf.sendRequestVote(voteChan, idx, &args)
+				}
+			}
+
+			votesReceived := 1
+			votesRequired := len(rf.peers)/2 + 1
+
+			for i := 0; i < len(rf.peers)-1; i++ {
+				vote := <-voteChan
+				if vote == true {
+					votesReceived++
+				}
+				if votesReceived == votesRequired {
+					break
+				}
+			}
+
+			if votesReceived >= votesRequired {
+				rf.mu.Lock()
+				if args.Term == rf.currentTerm {
+					rf.electionTimer.Stop()
+					rf.currentState = Leader
+					rf.votedFor = rf.me
+					rf.persist()
+					for i, _ := range rf.peers {
+						if i != rf.me {
+							rf.leaderNotifyChan[i] <- rf.currentTerm
+						}
+					}
+				}
+				rf.mu.Unlock()
+			}
+		}()
+
 	}
+}
+
+func (rf *Raft) transitionToFollower(vote int) {
+	rf.votedFor = vote
+	rf.currentState = Follower
+	rf.persist()
+	rf.electionTimer.Reset(GetRandomTimeout(rf.electionTimeout))
 }
 
 // the service or tester wants to create a Raft server. the ports

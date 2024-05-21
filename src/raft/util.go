@@ -1,6 +1,8 @@
 package raft
 
 import "log"
+import "math/rand"
+import "time"
 
 // Debugging
 const Debug = false
@@ -24,4 +26,8 @@ func max(a, b int) int {
 		return b
 	}
 	return a
+}
+
+func GetRandomTimeout(timeout time.Duration) time.Duration {
+	return timeout + time.Duration(rand.Float64()*float64(timeout))
 }
