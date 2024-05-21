@@ -25,6 +25,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"log"
 
 	// "cpsc416/labgob"
 	"cpsc416/labgob"
@@ -46,6 +47,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 
 	// For 2D:
 	SnapshotValid bool
@@ -74,6 +76,8 @@ type Raft struct {
 	candidateState CandidateState
 	leaderState    LeaderState
 
+	leaderNotifyChan []chan int
+
 	heartbeat bool				// keeps track of the last heartbeat
 
 	currentTerm int				// current term at this Raft
@@ -86,7 +90,8 @@ type Raft struct {
 	snapshot  []byte			// latest snapshot, snapshot index at log[0].Index, term at log[0].Term
 	
 	applyCh   chan ApplyMsg		// channel to pass results to the server
-	applyQueue chan struct{}	// channel to signal commandApplier
+	applyChQueue chan *ApplyMsg
+	applyMsgCh chan int	// channel to signal commandApplier
 }
 
 // Returns currentTerm and whether this server believes it is the leader.
@@ -112,7 +117,6 @@ func (rf *Raft) init() {
 		rf:         rf,
 		nextIndex:  make(map[int]int),
 		matchIndex: make(map[int]int),
-		cond:       sync.NewCond(&rf.mu),
 	}
 
 	rf.heartbeat = false
@@ -120,8 +124,10 @@ func (rf *Raft) init() {
 	rf.currentTerm = 0
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+	rf.leaderNotifyChan = make([]chan int, len(rf.peers))
 	rf.log = make([]LogEntry, 1)
-	rf.applyQueue = make(chan struct{})
+	rf.applyMsgCh = make(chan int, 1000)
+	rf.applyChQueue = make(chan *ApplyMsg, 10000)
 	rf.snapshot = nil
 
 	rf.log[0] = LogEntry{
@@ -146,26 +152,32 @@ func (rf *Raft) persist() {
 // Restores previously persisted state.
 func (rf *Raft) readPersist() {
 	data := rf.persister.ReadRaftState()
-	if rf.persister.RaftStateSize() > 0 { // bootstrap without any state?
-		r := bytes.NewBuffer(data)
-		d := labgob.NewDecoder(r)
-		var currentTerm, votedFor int
-		var log []LogEntry
-
-		if d.Decode(&currentTerm) != nil ||
-			d.Decode(&votedFor) != nil ||
-			d.Decode(&log) != nil {
-
-			fmt.Println("Error decoding persist")
-			return
-		}
-
-		//success
-		rf.currentTerm = currentTerm
-		rf.votedFor = votedFor
-		rf.log = log
-	}
 	rf.snapshot = rf.persister.ReadSnapshot()
+
+	if data == nil || len(data) < 1 {
+		rf.snapshot = nil
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm, votedFor int
+	var logs []LogEntry
+
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+
+		log.Fatal("Error decoding persist")
+		return
+	}
+
+	//success
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.log = logs
+	rf.lastApplied = rf.log[0].Index
+	rf.commitIndex = rf.log[0].Index
 }
 
 // The service says it has created a snapshot that has
@@ -177,30 +189,52 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	defer rf.mu.Unlock()
 	defer rf.persist()
 
-	if index <= rf.log[0].Index || index > rf.log[len(rf.log)-1].Index {
+	snapIndex := rf.log[0].Index
+
+	if index <= snapIndex {
 		return
+	}
+
+	if index > rf.log[len(rf.log)-1].Index {
+		log.Fatal("Snapshot index past the end of")
+	}
+	var reapplyLogs []LogEntry
+
+	if rf.lastApplied > index {
+		reapplyLogs = append(reapplyLogs, rf.log[index+1-snapIndex:rf.lastApplied-snapIndex+1]...)
 	}
 
 	// Update snapshot data
 	rf.snapshot = snapshot
-	snapshotIndex := index
-	currSnapIndex := rf.log[0].Index
-	snapshotTerm := rf.log[index-currSnapIndex].Term
+	rf.log = rf.log[index-snapIndex:]
+	rf.persist()
 
-	// remove all log entries up to the snapIndex and save the snapshot
-	newLog := make([]LogEntry, 0)
-	newLog = append(newLog, LogEntry{Index: snapshotIndex, Term: snapshotTerm})
-
-	if xIdx := index - currSnapIndex; xIdx >= 0 && xIdx < len(rf.log) {
-		// I have the log entry; keep entries after
-		newLog = append(newLog, rf.log[index-currSnapIndex+1:]...)
+	rf.applyChQueue <- &ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:		rf.snapshot,
+		SnapshotTerm:	rf.log[0].Term,
+		SnapshotIndex:	rf.log[0].Index,
 	}
 
-	rf.log = newLog
+	for _, entry := range reapplyLogs {
+		rf.applyChQueue <- &ApplyMsg{
+			CommandValid:  true,
+			Command:       entry.Command,
+			CommandIndex:  entry.Index,
+			CommandTerm:   entry.Term,
+		}
+	}
 
-	go func() {
-		rf.applyQueue <- struct{}{}
-	}()
+	for i, _ := range rf.peers {
+		if i != rf.me {
+			if rf.leaderState.matchIndex[i] < rf.log[0].Index {
+				rf.leaderState.matchIndex[i] = rf.log[0].Index
+			}
+			if rf.leaderState.nextIndex[i] <= rf.leaderState.matchIndex[i] {
+				rf.leaderState.nextIndex[i] = rf.leaderState.matchIndex[i] + 1
+			}
+		}
+	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -224,7 +258,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	//If not leader, just return false
 	if rf.currentState != Leader {
-		return index, term, false
+		return -1, -1, false
 	}
 
 	//Else add command
@@ -234,7 +268,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    term,
 	}
 	rf.log = append(rf.log, newEntry)
-	rf.leaderState.cond.Broadcast()
 	rf.persist()
 	
 	return index, term, true
@@ -247,8 +280,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	rf.leaderState.cond.Broadcast()
-	rf.applyQueue <- struct{}{}
+	rf.applyMsgCh <- 5
 }
 
 // returns whether the raft instance has been killed by the tester
@@ -262,12 +294,12 @@ func (rf *Raft) killed() bool {
 // if no heartbeat occurred between successive checks
 func (rf *Raft) ticker() {
 	for !rf.killed() {
-		ms := 250 + (rand.Int63() % 200)
+		ms := 150 + (rand.Int63() % 100)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
 		rf.mu.Lock()
-		if !rf.heartbeat && !rf.killed() {
-			go rf.candidateState.startElection()
+		if rf.currentState != Leader && !rf.heartbeat {
+			rf.candidateState.startElection()
 		}
 		rf.heartbeat = false
 		rf.mu.Unlock()
@@ -299,6 +331,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 
 	rf.init()
+	for i, _ := range peers {
+		if i != me {
+			rf.leaderNotifyChan[i] = make(chan int, 1000)
+			go rf.leaderState.logSender(i)
+		}
+	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist()
@@ -306,6 +344,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start goroutines
 	go rf.ticker()
 	go rf.commandApplier()
+	go rf.commandCommitter()
 
 	return rf
 }

@@ -1,7 +1,5 @@
 package raft
 
-import "fmt"
-
 type RequestVoteArgs struct {
 	Term         int
 	CandidateID  int
@@ -18,19 +16,21 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.Term = rf.currentTerm
 
 	// If candidate is stale then reject
 	if args.Term < rf.currentTerm { // Candidate is of lesser term
+		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
 	}
+	
 	changed := false
+	reply.VoteGranted = false
 
 	// Else if this is stale then become follower and check to grant vote, no matter what state
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
-		reply.Term = rf.currentTerm
+		reply.Term = args.Term
 		rf.currentState = Follower
 		rf.votedFor = -1
 		changed = true
@@ -82,38 +82,116 @@ type AppendEntriesReply struct {
 	XTerm  int
 	XIndex int
 	XLen   int
-
-	NeedsSnapshot bool
-	XIsShort bool
 }
 
 // AppendEntries RPC handler
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// fmt.Printf("S%d AE received from %d - term %d\n", rf.me, args.LeaderId, args.Term)
 	// If stale, then reject
 	if args.Term < rf.currentTerm {
+		// fmt.Printf("S%d AE rejected from %d - term %d\n", rf.me, args.LeaderId, args.Term)
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
+	// fmt.Printf("S%d AE proceeded from %d - term %d\n", rf.me, args.LeaderId, args.Term)
 	rf.heartbeat = true
 
 	// Candidate and got appendEntries from new leader with same term
-	if rf.currentState == Candidate && args.Term == rf.currentTerm {
-		rf.currentState = Follower
-	} else if args.Term > rf.currentTerm { // Any state and got appendEntries from new leader
+	if args.Term > rf.currentTerm { // Any state and got appendEntries from new leader
 		rf.currentTerm = args.Term
 		rf.currentState = Follower
 		rf.votedFor = -1
 		rf.persist()
+	} else if rf.currentState == Candidate {
+		rf.currentState = Follower
+		rf.votedFor = rf.me
+		rf.persist()
 	}
+
+	reply.Term = args.Term
+	reply.Success = false
+
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 	snapshotIndex := rf.log[0].Index
-	snapshotTerm := rf.log[0].Term
-	lastLogIndex := rf.log[len(rf.log)-1].Index
+	if args.PrevLogIndex < snapshotIndex {
+		args.PrevLogIndex = snapshotIndex
+		cutAt := 0
+		for i, entry := range args.Entries {
+			if entry.Index <= args.PrevLogIndex {
+				cutAt = i + 1
+			} else {
+				break
+			}
+		}
+		if cutAt >= len(args.Entries) {
+			args.Entries = []LogEntry{}
+		} else {
+			args.Entries = args.Entries[cutAt:]
+		}
+	} else if args.PrevLogIndex > snapshotIndex+len(rf.log)-1 {
+		// I dont have prevlogindex
+		reply.XIndex = snapshotIndex + len(rf.log)
+		reply.Success = false
+		return
+	} else if rf.log[args.PrevLogIndex-snapshotIndex].Term != args.PrevLogTerm {
+		i := args.PrevLogIndex - snapshotIndex
+		for i >= 1 && rf.log[i].Term == rf.log[i-1].Term {
+			i--
+		}
+		reply.XIndex = i
+		reply.Success = false
+		return
+	}
 
+	reply.Success = true
+
+	// My Log matches with leader at the prev index.
+	appendIndex := args.PrevLogIndex - snapshotIndex
+
+	for idx, entry := range args.Entries {
+		appendIndex++
+		if appendIndex >= len(rf.log) {
+			rf.log = append(rf.log, args.Entries[idx:]...)
+			appendIndex += len(args.Entries[idx:]) - 1
+			break
+		}
+		if rf.log[appendIndex].Term != entry.Term {
+			rf.log = append(rf.log[:appendIndex], args.Entries[idx:]...)
+			appendIndex += len(args.Entries[idx:]) - 1
+			break
+		}
+		rf.log[appendIndex] = entry
+	}
+
+	appendIndex += snapshotIndex
+
+	if args.LeaderCommit > rf.commitIndex {
+		if args.LeaderCommit <= appendIndex {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = appendIndex
+		}
+	}
+
+	if appendIndex > args.PrevLogIndex {
+		rf.persist()
+	}
+
+	for rf.lastApplied < rf.commitIndex {
+		idx := rf.lastApplied + 1  - snapshotIndex
+		entry := rf.log[idx]
+		rf.applyChQueue <- &ApplyMsg{
+			CommandValid:  true,
+			Command:       entry.Command,
+			CommandIndex:  entry.Index,
+			CommandTerm:   entry.Term,
+		}
+		rf.lastApplied++
+	}
 
 	//  These are possible cases:
 	//  case 0) if !(0 <= args.PrevIndex <= rf.XIndex + len(rf.logs)), the given args.PrevIndex is out our search space. Then, we tell the leader that our log is short, and ask for a prevLogIndex set to reply.XLen+1. In the next round, we decide about the APE.
@@ -125,84 +203,84 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//			1. if prevLogIdx == -1 we need a new snapshot because we cannot find such a j, meaning there is no search space for that (see 1.1)
 	// 			2. if j==-2: we need a new snapshot because we couldn't find such a j, i.e. we searched but such j is before our last snapshot
 	// 			3. if j>=-1: set the reply.XIndex=rf.logs[j+1].Index, i.e. we could find the j that satisfies case 2.
-	prevLogIdx := args.PrevLogIndex - snapshotIndex - 1 // 6 0 - 1 = 0
-	if !(args.PrevLogIndex >= snapshotIndex && args.PrevLogIndex <= lastLogIndex) {
-		// case 0) claim that the log is shorter
-		reply.Success = false
-		reply.Term = rf.currentTerm
-		reply.XIsShort = true
-		reply.XLen = lastLogIndex
-		return
-	} else if !(prevLogIdx == -1 && args.PrevLogIndex == snapshotIndex && args.PrevLogTerm == snapshotTerm) && 
-		!(prevLogIdx >= 0 && args.PrevLogIndex == rf.log[prevLogIdx+1].Index && args.PrevLogTerm == rf.log[prevLogIdx+1].Term) {
-		// if it is not case 1), so we are in case 2)
-		reply.Success = false
-		reply.Term = rf.currentTerm
-		reply.XLen = lastLogIndex
-		fmt.Printf("2.1")
+	// prevLogIdx := args.PrevLogIndex - snapshotIndex - 1 // 6 0 - 1 = 0
+	// if !(args.PrevLogIndex >= snapshotIndex && args.PrevLogIndex <= lastLogIndex) {
+	// 	// case 0) claim that the log is shorter
+	// 	reply.Success = false
+	// 	reply.Term = rf.currentTerm
+	// 	reply.XIsShort = true
+	// 	reply.XLen = lastLogIndex
+	// 	return
+	// } else if !(prevLogIdx == -1 && args.PrevLogIndex == snapshotIndex && args.PrevLogTerm == snapshotTerm) && 
+	// 	!(prevLogIdx >= 0 && args.PrevLogIndex == rf.log[prevLogIdx+1].Index && args.PrevLogTerm == rf.log[prevLogIdx+1].Term) {
+	// 	// if it is not case 1), so we are in case 2)
+	// 	reply.Success = false
+	// 	reply.Term = rf.currentTerm
+	// 	reply.XLen = lastLogIndex
+	// 	fmt.Printf("2.1")
 
-		if prevLogIdx == -1 {
-			// case 2.1
-			reply.NeedsSnapshot = true
-			return
-		}
+	// 	if prevLogIdx == -1 {
+	// 		// case 2.1
+	// 		reply.NeedsSnapshot = true
+	// 		return
+	// 	}
 
-		j := prevLogIdx - 1
-		for j >= 0 {
-			if (j >= 1 && rf.log[j].Term != rf.log[prevLogIdx].Term) || (j == 0 && snapshotTerm != args.PrevLogTerm) {
-				break
-			}
-			j -= 1
-		}
+	// 	j := prevLogIdx - 1
+	// 	for j >= 0 {
+	// 		if (j >= 1 && rf.log[j].Term != rf.log[prevLogIdx].Term) || (j == 0 && snapshotTerm != args.PrevLogTerm) {
+	// 			break
+	// 		}
+	// 		j -= 1
+	// 	}
 
-		if j == -1 {
-			// case 2.2
-			reply.NeedsSnapshot = true
-			return
-		}
+	// 	if j == -1 {
+	// 		// case 2.2
+	// 		reply.NeedsSnapshot = true
+	// 		return
+	// 	}
 
-		// case 2.3
-		reply.XIndex = rf.log[j+1].Index
-		reply.XTerm = rf.log[j+1].Term
+	// 	// case 2.3
+	// 	reply.XIndex = rf.log[j+1].Index
+	// 	reply.XTerm = rf.log[j+1].Term
 
-		return
-	}
+	// 	return
+	// }
 
 
-	// case 1)
-	// If an existing entry conflicts with a new one (same index but different terms),
-	// delete the existing entry and all that follow it (§5.3)
-	for _, newEntry := range args.Entries {
-		if newEntry.Index <= lastLogIndex &&
-			rf.log[newEntry.Index-snapshotIndex].Term != newEntry.Term {
-			rf.log = rf.log[:newEntry.Index-snapshotIndex]
-			break
-		}
-	}
-	// Append any new entries not already in the log
-	lastLogIndex = rf.log[len(rf.log)-1].Index
-	for _, newEntry := range args.Entries {
-		if newEntry.Index > lastLogIndex {
-			// Append the new entry to the log
-			rf.log = append(rf.log, newEntry)
-		}
-	}
-	if len(args.Entries) > 0 {
-		// DPrintf("Follower %v: Finished call to AppendEntries with lastLog: %v", rf.me, rf.log[len(rf.log)-1])
-		defer rf.persist()
-	}
+	// // case 1)
+	// // If an existing entry conflicts with a new one (same index but different terms),
+	// // delete the existing entry and all that follow it (§5.3)
+	// for _, newEntry := range args.Entries {
+	// 	if newEntry.Index <= lastLogIndex &&
+	// 		rf.log[newEntry.Index-snapshotIndex].Term != newEntry.Term {
+	// 		rf.log = rf.log[:newEntry.Index-snapshotIndex]
+	// 		break
+	// 	}
+	// }
+	// // Append any new entries not already in the log
+	// lastLogIndex = rf.log[len(rf.log)-1].Index
+	// for _, newEntry := range args.Entries {
+	// 	if newEntry.Index > lastLogIndex {
+	// 		// Append the new entry to the log
+	// 		rf.log = append(rf.log, newEntry)
+	// 	}
+	// }
+	// if len(args.Entries) > 0 {
+	// 	// DPrintf("Follower %v: Finished call to AppendEntries with lastLog: %v", rf.me, rf.log[len(rf.log)-1])
+	// 	defer rf.persist()
+	// }
 
-	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, rf.log[len(rf.log) - 1].Index)
-	}
+	// // If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	// if args.LeaderCommit > rf.commitIndex {
+	// 	rf.commitIndex = min(args.LeaderCommit, rf.log[len(rf.log) - 1].Index)
+	// }
 
-	go func() {
-		rf.applyQueue <- struct{}{}
-	}()
+	// go func() {
+	// 	rf.applyMsgCh <- struct{}{}
+	// }()
 
-	reply.Term = rf.currentTerm
-	reply.Success = true
+	// reply.Term = args.Term
+	// reply.Success = true
 }
 
 type InstallSnapshotArgs struct {
@@ -221,10 +299,15 @@ type InstallSnapshotReply struct {
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.Term = rf.currentTerm
+	
 	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
 		return
 	}
+
+	reply.Term = args.Term
+	rf.currentTerm = args.Term
 
 	currSnapIndex := rf.log[0].Index
 	currSnapTerm := rf.log[0].Term
@@ -255,8 +338,4 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.log = newLog
 
 	reply.Success = true
-
-	go func() {
-		rf.applyQueue <- struct{}{}
-	}()
 }

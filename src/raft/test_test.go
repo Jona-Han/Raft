@@ -8,14 +8,12 @@ package raft
 // test with the original before submitting.
 //
 
-import (
-	"fmt"
-	"math/rand"
-	"sync"
-	"sync/atomic"
-	"testing"
-	"time"
-)
+import "testing"
+import "fmt"
+import "time"
+import "math/rand"
+import "sync/atomic"
+import "sync"
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -62,19 +60,15 @@ func TestReElection2A(t *testing.T) {
 	leader1 := cfg.checkOneLeader()
 
 	// if the leader disconnects, a new one should be elected.
-	DPrintf("disconnected leader %v", leader1)
 	cfg.disconnect(leader1)
 	cfg.checkOneLeader()
 
-	DPrintf("2")
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader. and the old leader
 	// should switch to follower.
-
 	cfg.connect(leader1)
 	leader2 := cfg.checkOneLeader()
 
-	DPrintf("3")
 	// if there's no quorum, no new leader should
 	// be elected.
 	cfg.disconnect(leader2)
@@ -1127,7 +1121,6 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 			cfg.one(rand.Int(), servers-1, true)
 		}
 		if crash {
-			DPrintf("----TESTER---- %v is disconnected", victim)
 			cfg.crash1(victim)
 			cfg.one(rand.Int(), servers-1, true)
 		}
@@ -1159,7 +1152,6 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 			leader1 = cfg.checkOneLeader()
 		}
 		if crash {
-			DPrintf("----TESTER---- %v is reconnected", victim)
 			cfg.start1(victim, cfg.applierSnap)
 			cfg.connect(victim)
 			cfg.one(rand.Int(), servers, true)

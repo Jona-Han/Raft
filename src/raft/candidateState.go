@@ -4,9 +4,6 @@ package raft
 // server in its candidate state.
 // Includes election checks
 
-import (
-	"time"
-)
 
 type CandidateState struct {
 	rf                *Raft		// this raft instance
@@ -15,14 +12,6 @@ type CandidateState struct {
 
 // Initiates an election for a raft server
 func (cs *CandidateState) startElection() {
-	cs.rf.mu.Lock()
-
-	if cs.rf.currentState == Leader {
-		cs.rf.mu.Unlock()
-		return
-	}
-
-	cs.rf.heartbeat = true
 	cs.rf.currentState = Candidate
 	cs.rf.currentTerm += 1
 	cs.rf.votedFor = cs.rf.me
@@ -35,9 +24,8 @@ func (cs *CandidateState) startElection() {
 		LastLogTerm:  cs.rf.log[len(cs.rf.log)-1].Term,
 		CandidateID:  cs.rf.me,
 	}
-	cs.rf.mu.Unlock()
 
-	for i := range cs.rf.peers {
+	for i, _ := range cs.rf.peers {
 		if i != cs.rf.me {
 			go cs.sendRequestVote(i, &args)
 		}
@@ -54,10 +42,10 @@ func (cs *CandidateState) isElected() bool {
 // sends a request vote rpc call to the server in params
 // requests a vote from
 func (cs *CandidateState) sendRequestVote(server int, args *RequestVoteArgs) {
-	for !cs.rf.killed() {
+	// for !cs.rf.killed() {
 		cs.rf.mu.Lock()
 		// If not a candidate or not in the expected voting term, stop vote request
-		if cs.rf.currentState != Candidate || cs.rf.currentTerm > args.Term {
+		if cs.rf.currentState != Candidate || cs.rf.currentTerm != args.Term {
 			cs.rf.mu.Unlock()
 			return
 		}
@@ -67,8 +55,7 @@ func (cs *CandidateState) sendRequestVote(server int, args *RequestVoteArgs) {
 		ok := cs.rf.peers[server].Call("Raft.RequestVote", args, &reply)
 
 		if !ok {
-			time.Sleep(10 * time.Millisecond)
-			continue
+			return
 		}
 
 		cs.rf.mu.Lock()
@@ -85,14 +72,16 @@ func (cs *CandidateState) sendRequestVote(server int, args *RequestVoteArgs) {
 		} else if reply.VoteGranted && 
 		cs.rf.currentState == Candidate && 
 		args.Term == cs.rf.currentTerm {
-
 			cs.numOfVotes += 1
 			if cs.isElected() {
+				// fmt.Printf("S%d I'm elected. %d\n", cs.rf.me, cs.rf.currentTerm)
 				cs.rf.currentState = Leader
-				cs.rf.leaderState.init()
-				cs.rf.leaderState.cond.Broadcast()
+				for i, _ := range cs.rf.peers {
+					if i != cs.rf.me {
+						cs.rf.leaderNotifyChan[i] <- cs.rf.currentTerm
+					}
+				}
 			}
 		}
-		return
-	}
+	// }
 }
