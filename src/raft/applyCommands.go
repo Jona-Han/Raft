@@ -30,13 +30,13 @@ func (rf *Raft) commandCommitter() {
 		for ci < idx {
 			nextIndex := ci + 1
 
-			req := (len(rf.peers)/2 + 1) - 1
+			majorityReq := (len(rf.peers)/2 + 1) - 1
 			for i, _ := range rf.peers {
 				if i != rf.me && rf.leaderState.matchIndex[i] >= nextIndex {
-					req -= 1
+					majorityReq -= 1
 				}
 			}
-			if req <= 0 {
+			if majorityReq <= 0 {
 				ci += 1
 			} else {
 				break

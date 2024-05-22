@@ -72,10 +72,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
-
-	XTerm  int
 	XIndex int
-	XLen   int
 }
 
 // AppendEntries RPC handler
@@ -97,12 +94,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.transitionToFollower(rf.me)
 	}
 
-	rf.electionTimer.Reset(GetRandomTimeout(rf.electionTimeout))
+	rf.electionTimer.Reset(GetRandTimeout())
 
 	reply.Term = args.Term
 	reply.Success = false
 
-	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 	snapshotIndex := rf.log[0].Index
 	if args.PrevLogIndex < snapshotIndex {
 		args.PrevLogIndex = snapshotIndex
@@ -120,7 +116,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			args.Entries = args.Entries[cutAt:]
 		}
 	} else if args.PrevLogIndex > snapshotIndex+len(rf.log)-1 {
-		// I dont have prevlogindex
 		reply.XIndex = snapshotIndex + len(rf.log)
 		reply.Success = false
 		return
@@ -136,7 +131,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Success = true
 
-	// My Log matches with leader at the prev index.
 	appendIndex := args.PrevLogIndex - snapshotIndex
 
 	for idx, entry := range args.Entries {
@@ -186,7 +180,7 @@ type InstallSnapshotArgs struct {
 }
 
 type InstallSnapshotReply struct {
-	Term    int  // current term of the follower
+	Term    int 
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {

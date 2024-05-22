@@ -75,10 +75,6 @@ type Raft struct {
 	leaderNotifyChan []chan int
 
 	electionTimer            *time.Ticker
-	electionTimeout          time.Duration
-
-	heartBeatTimeout         time.Duration
-	heartBeatTicker 		[]*time.Ticker
 
 	currentTerm int				// current term at this Raft
 	votedFor    int				// the peer this Raft voted for during the last election
@@ -89,9 +85,9 @@ type Raft struct {
 
 	snapshot  []byte			// latest snapshot, snapshot index at log[0].Index, term at log[0].Term
 	
-	applyCh   chan ApplyMsg		// channel to pass results to the server
-	applyChQueue chan *ApplyMsg
-	applyMsgCh chan int	// channel to signal commandApplier
+	applyCh   chan ApplyMsg		// channel to pass results to the client
+	applyChQueue chan *ApplyMsg	// channel to queue applyMsg to the client
+	applyMsgCh chan int			// channel to signal commandApplier
 }
 
 // Returns currentTerm and whether this server believes it is the leader.
@@ -129,8 +125,7 @@ func (rf *Raft) init() {
 		Index: 0,
 		Term:  0,
 	}
-	rf.electionTimeout = time.Millisecond * 300
-	rf.electionTimer = time.NewTicker(GetRandomTimeout(rf.electionTimeout))
+	rf.electionTimer = time.NewTicker(GetRandTimeout())
 }
 
 // Saves Raft's persistent state to stable storage,
@@ -191,7 +186,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	}
 
 	if index > rf.log[len(rf.log)-1].Index {
-		log.Fatal("Snapshot index past the end of")
+		log.Fatal("Snapshot index past the end of log")
 	}
 	var reapplyLogs []LogEntry
 
@@ -284,98 +279,12 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) sendRequestVote(voteChan chan bool, server int, args *RequestVoteArgs) {
-	reply := RequestVoteReply{}
-
-	ok := rf.peers[server].Call("Raft.RequestVote", args, &reply)
-
-	if !ok || !reply.VoteGranted {
-		voteChan <- false
-		if ok && reply.Term > args.Term {
-			rf.mu.Lock()
-			if rf.currentTerm < reply.Term {
-				rf.currentTerm = reply.Term
-				rf.transitionToFollower(-1)
-			}
-			rf.mu.Unlock()
-		}
-	} else {
-		voteChan <- true
-	}
-}
-
-// subroutine that checks for heartbeat timeout and starts election
-// if no heartbeat occurred between successive checks
-func (rf *Raft) ticker() {
-	for !rf.killed() {
-		<-rf.electionTimer.C
-		rf.mu.Lock()
-		if rf.currentState == Leader {
-			rf.electionTimer.Stop()
-			rf.mu.Unlock()
-			continue
-		}
-		rf.currentTerm++
-		rf.currentState = Candidate
-		rf.votedFor = rf.me
-
-		lastLogTerm := rf.log[len(rf.log)-1].Term
-		lastLogIndex := rf.log[len(rf.log)-1].Index
-		args := RequestVoteArgs{
-			Term:         rf.currentTerm,
-			CandidateID:  rf.me,
-			LastLogTerm:  lastLogTerm,
-			LastLogIndex: lastLogIndex,
-		}
-
-		rf.electionTimer.Reset(GetRandomTimeout(rf.electionTimeout))
-		rf.mu.Unlock()
-		go func() {
-			voteChan := make(chan bool, len(rf.peers))
-			for idx, _ := range rf.peers {
-				if idx != rf.me {
-					go rf.sendRequestVote(voteChan, idx, &args)
-				}
-			}
-
-			votesReceived := 1
-			votesRequired := len(rf.peers)/2 + 1
-
-			for i := 0; i < len(rf.peers)-1; i++ {
-				vote := <-voteChan
-				if vote == true {
-					votesReceived++
-				}
-				if votesReceived == votesRequired {
-					break
-				}
-			}
-
-			if votesReceived >= votesRequired {
-				rf.mu.Lock()
-				if args.Term == rf.currentTerm {
-					rf.electionTimer.Stop()
-					rf.currentState = Leader
-					rf.votedFor = rf.me
-					rf.persist()
-					for i, _ := range rf.peers {
-						if i != rf.me {
-							rf.leaderNotifyChan[i] <- rf.currentTerm
-						}
-					}
-				}
-				rf.mu.Unlock()
-			}
-		}()
-
-	}
-}
 
 func (rf *Raft) transitionToFollower(vote int) {
 	rf.votedFor = vote
 	rf.currentState = Follower
 	rf.persist()
-	rf.electionTimer.Reset(GetRandomTimeout(rf.electionTimeout))
+	rf.electionTimer.Reset(GetRandTimeout())
 }
 
 // the service or tester wants to create a Raft server. the ports
