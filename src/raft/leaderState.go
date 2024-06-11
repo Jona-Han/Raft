@@ -37,11 +37,11 @@ func (ls *LeaderState) logSender(server int) {
 			}
 			ls.rf.mu.Unlock()
 			go func(term int) {
+				ls.rf.mu.Lock()
+				defer ls.rf.mu.Unlock()
 				if term != ls.rf.currentTerm {
 					return // fast exit
 				}
-				ls.rf.mu.Lock()
-				defer ls.rf.mu.Unlock()
 
 				matchIndex := ls.matchIndex[server]
 				nextIndex := ls.nextIndex[server]
