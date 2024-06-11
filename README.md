@@ -1,3 +1,5 @@
+[![Go](https://github.com/Jona-Han/Raft/actions/workflows/go.yml/badge.svg)](https://github.com/Jona-Han/Raft/actions/workflows/go.yml)
+
 # Raft consensus algorithm
 
 
